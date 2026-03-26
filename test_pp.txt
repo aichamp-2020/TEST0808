@@ -1,768 +1,498 @@
 """
-PDF PII Masker v5
-=================
-Fixes over v4:
-  1. FONT MATCHING — reads per-char font size/bold from pdfplumber, draws masked
-     text in LiberationSans (metric-compatible Helvetica) at the exact same pt size
-     converted to pixels, so replaced text is visually indistinguishable in weight
-     and size from the original.
-
-  2. PRECISION DETECTION — rebuilt ORG layer uses strict suffix-only anchoring with
-     a comprehensive label-context stoplist. Added LABEL:VALUE context detector so
-     "Submitted By: John Smith" / "Policyholder: Aarav Mehta" patterns are caught.
-     ORG spans no longer capture their surrounding label text.
-
-Targets: NAME · ORG · ADDRESS · PHONE · EMAIL · SSN · ACCOUNT · DOB · EIN · NPI
+PDF PII Masker v6 — Spatial Precision + OCR + Font Match
+=========================================================
+Architecture:
+  Detection  : pdfplumber.extract_text() — correct reading order
+  Positioning: Spatial char grouping from PDF char stream — exact pixel coords
+  Rendering  : LiberationSans at PDF pt-size × render-scale, matched text color
+  OCR        : pytesseract on image-based pages (no selectable text)
 """
-
-import re, sys, random, logging, argparse, dataclasses, hashlib
+import re,sys,random,logging,argparse,dataclasses,hashlib
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List,Dict,Tuple,Any
 
-import pdfplumber
-import pypdfium2 as pdfium
-from PIL import Image, ImageDraw, ImageFont
+import pdfplumber, pypdfium2 as pdfium
+from PIL import Image,ImageDraw,ImageFont
+
+try:
+    import pytesseract; TESS=True
+except: TESS=False
 
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s  %(levelname)-8s  %(message)s",
-                    datefmt="%H:%M:%S")
-log = logging.getLogger("pii_v5")
+    format="%(asctime)s  %(levelname)-8s  %(message)s",datefmt="%H:%M:%S")
+log=logging.getLogger("pii_v6")
 
-# ══════════════════════════════════════════════════════════════════════
-#  Font resolution — LiberationSans = metric Helvetica replacement
-# ══════════════════════════════════════════════════════════════════════
-_FONT_PATHS = {
-    ("regular", False): "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ("bold",    False): "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ("regular", True):  "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ("bold",    True):  "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-}
-_FALLBACK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-_FONT_CACHE: Dict[Tuple, ImageFont.ImageFont] = {}
+# ── Fonts ────────────────────────────────────────────────────────────
+_FR="/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+_FB="/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+_FF="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_FC={}
+def _font(px,bold=False):
+    k=(px,bold)
+    if k in _FC: return _FC[k]
+    try: f=ImageFont.truetype(_FB if bold else _FR,max(6,px))
+    except: f=ImageFont.truetype(_FF,max(6,px))
+    _FC[k]=f; return f
 
-def get_font(size_px: int, bold: bool = False) -> ImageFont.ImageFont:
-    key = (size_px, bold)
-    if key in _FONT_CACHE:
-        return _FONT_CACHE[key]
-    path = _FONT_PATHS.get(("bold" if bold else "regular", False), _FALLBACK_FONT)
-    try:
-        f = ImageFont.truetype(path, max(6, size_px))
-    except Exception:
-        f = ImageFont.load_default()
-    _FONT_CACHE[key] = f
-    return f
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Per-word font metrics extracted from pdfplumber char stream
-# ══════════════════════════════════════════════════════════════════════
+# ── Spatial word (from PDF char stream) ─────────────────────────────
 @dataclasses.dataclass
-class WBox:
-    text: str
-    x0: float; top: float; x1: float; bottom: float
-    font_size: float = 9.0   # pt size from PDF char stream
-    bold: bool = False
+class SW:
+    text:str; x0:float; top:float; x1:float; bottom:float
+    size:float; bold:bool; color:Tuple
 
-def _get_words(page) -> List[WBox]:
-    """Extract words with bounding boxes AND font metrics from char stream."""
-    # Build char-level font map keyed by (x, y) bucket
-    char_map: Dict[Tuple[int,int], Tuple[float,bool]] = {}
-    for c in page.chars:
-        xk = int(c["x0"])
-        yk = int(c["top"])
-        fname = c.get("fontname","")
-        size  = float(c.get("size", 9.0))
-        bold  = "Bold" in fname or "bold" in fname
-        char_map[(xk, yk)] = (size, bold)
-
-    words = []
-    for w in page.extract_words(keep_blank_chars=False, use_text_flow=True):
-        # Look up font by word's top-left char position
-        xk = int(w["x0"])
-        yk = int(w["top"])
-        size, bold = 9.0, False
-        for dx in range(0, 5):
-            for dy in range(0, 5):
-                entry = char_map.get((xk+dx, yk+dy))
-                if entry:
-                    size, bold = entry
-                    break
-            if size != 9.0:
-                break
-        words.append(WBox(
-            text=w["text"], x0=w["x0"], top=w["top"],
-            x1=w["x1"], bottom=w["bottom"],
-            font_size=size, bold=bold
-        ))
+def _build_sw(page)->List[SW]:
+    raw=page.chars
+    if not raw: return []
+    groups=[]; cur=[]
+    for c in raw:
+        if not c["text"] or not c["text"].strip():
+            if cur: groups.append(cur); cur=[]; continue
+        if not cur: cur.append(c); continue
+        gap=c["x0"]-cur[-1]["x1"]; dy=abs(c["top"]-cur[-1]["top"])
+        if dy<3 and gap<3: cur.append(c)
+        else:
+            if cur: groups.append(cur)
+            cur=[c]
+    if cur: groups.append(cur)
+    words=[]
+    for g in groups:
+        text="".join(c["text"] for c in g)
+        fn=g[0].get("fontname",""); bold="Bold" in fn or "bold" in fn
+        col=g[0].get("non_stroking_color",(0.,0.,0.))
+        if not isinstance(col,(list,tuple)): col=(0.,0.,0.)
+        col=tuple(float(v) for v in list(col)[:3])
+        if len(col)<3: col=col+(0.,)*(3-len(col))
+        words.append(SW(text=text,
+            x0=min(c["x0"] for c in g),top=min(c["top"] for c in g),
+            x1=max(c["x1"] for c in g),bottom=max(c["bottom"] for c in g),
+            size=float(g[0].get("size",9.0)),bold=bold,color=col))
     return words
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  Realistic fake-data engine  (same quality as v4)
-# ══════════════════════════════════════════════════════════════════════
-_FIRST = ["James","Robert","Michael","William","David","Richard","Joseph","Thomas",
-          "Mary","Patricia","Jennifer","Linda","Barbara","Elizabeth","Susan",
-          "Jessica","Sarah","Karen","Lisa","Nancy","Betty","Margaret",
-          "Emily","Ashley","Kimberly","Donna","Carol","Michelle","Amanda",
-          "Liam","Noah","Oliver","Lucas","Mason","Ethan","Sophia","Emma",
-          "Olivia","Ava","Isabella","Mia","Charlotte","Amelia","Harper"]
-_LAST  = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis",
-          "Rodriguez","Martinez","Lopez","Wilson","Anderson","Thomas","Taylor",
-          "Moore","Jackson","Martin","Lee","Perez","Thompson","White","Harris",
-          "Sanchez","Clark","Ramirez","Lewis","Robinson","Walker","Young",
-          "Allen","King","Wright","Scott","Torres","Nguyen","Hill","Flores",
-          "Green","Adams","Nelson","Baker","Hall","Rivera","Campbell","Mitchell",
-          "Carter","Roberts","Evans","Turner","Phillips","Parker","Collins"]
-_STREETS=["Oak","Maple","Cedar","Pine","Elm","Washington","Lincoln","Jefferson",
-           "Madison","Highland","Riverside","Meadow","Valley","Ridge","Lake",
-           "Spring","Prairie","Orchard","Sunset","Lakeview","Willow","Birch"]
-_STYPES =["Street","Avenue","Boulevard","Road","Lane","Drive","Court","Place",
-           "Way","Circle","Terrace","Trail"]
-_CITIES =["Springfield","Franklin","Clinton","Georgetown","Salem","Fairview",
-           "Madison","Arlington","Burlington","Greenville","Ashland","Midland",
-           "Oakland","Newport","Bristol","Lakewood","Clayton","Winchester",
-           "Millbrook","Riverside","Westfield","Maplewood","Hillcrest","Brookdale"]
-_STATES_L=["AL","AZ","AR","CA","CO","CT","FL","GA","IL","IN","IA","KS","KY",
-            "LA","ME","MD","MA","MI","MN","MO","NE","NV","NJ","NY","NC",
-            "OH","OK","OR","PA","TN","TX","UT","VA","WA","WI"]
-_EDOMAINS=["gmail","yahoo","outlook","icloud","hotmail","protonmail","fastmail","zoho"]
-_ORG_PFX =["Blue","Green","First","National","United","Premier","Global","Pacific",
-            "Atlantic","Central","Summit","Apex","Sterling","Meridian","Heritage",
-            "Lakeside","Riverside","Mountain","Coastal","Westbrook","Eastside"]
-_ORG_MID =["Medical","Health","Family","General","Regional","Community","Metro",
-            "City","County","Federal","Allied","Advanced","Premier","Integrated"]
-_ORG_TYP =["Analytics","Solutions","Services","Group","Systems","Consulting",
-            "Technologies","Associates","Capital","Management","Enterprises",
-            "Healthcare","Imaging","Diagnostics","Practice","Dental","Vision",
-            "Pharmacy","Rehab","Clinic","Center","Hospital","Laboratory"]
-
-
-class RealisticFaker:
-    def __init__(self, seed=42):
-        self._seed = seed
-        self._cache: Dict[str,str] = {}
-
-    def _rng(self, key:str) -> random.Random:
-        h = int(hashlib.md5((str(self._seed)+key).encode()).hexdigest(),16)
-        return random.Random(h & 0xFFFFFFFF)
-
-    def _fit(self, word:str, n:int) -> str:
-        w = word.strip() or "X"
-        if len(w) >= n: return w[:n].capitalize()
-        pad = "abcdefghijklmnopqrstuvwxyz"
-        while len(w) < n: w += pad[len(w)%len(pad)]
-        return w.capitalize()
-
-    def _fitlc(self, s:str, n:int) -> str:
-        s = s.strip() or "x"
-        if len(s) >= n: return s[:n]
-        while len(s) < n: s += s[-1]
-        return s
-
-    def fake_name(self, orig:str) -> str:
-        rng = self._rng(orig)
-        return " ".join(self._fit(rng.choice(_FIRST+_LAST), len(p))
-                        for p in orig.split())
-
-    def fake_org(self, orig:str) -> str:
-        rng = self._rng(orig)
-        pool = _ORG_PFX + _ORG_MID + _ORG_TYP + _CITIES
-        parts = orig.split()
-        return " ".join(
-            p if p.upper() in ("LLC","INC","LTD","CORP","LP","LLP","PC","PLLC")
-            else self._fit(rng.choice(pool), len(p))
-            for p in parts
-        )
-
-    def fake_ssn(self, orig:str) -> str:
-        rng = self._rng(orig)
-        sep = "." if "." in orig else (" " if " " in orig and "-" not in orig else "-")
-        d = f"9{rng.randint(10,99):02d}{sep}{rng.randint(10,99):02d}{sep}{rng.randint(1000,9999):04d}"
-        return _sl(d, orig)
-
-    def fake_email(self, orig:str) -> str:
-        rng = self._rng(orig)
-        clean = re.split(r'\n|\s{2,}', orig)[0].strip()
-        m = re.match(r"(.+)@(.+)\.([A-Za-z]{2,})", clean)
-        if not m: return self._scramble(orig)
-        local = self._fitlc(
-            f"{rng.choice(_FIRST).lower()}.{rng.choice(_LAST).lower()}", len(m.group(1)))
-        dom = self._fitlc(rng.choice(_EDOMAINS), len(m.group(2)))
-        return _sl(f"{local}@{dom}.{m.group(3)}", orig)
-
-    def fake_phone(self, orig:str) -> str:
-        rng = self._rng(orig)
-        new = list(f"{rng.randint(201,989):03d}{rng.randint(200,999):03d}{rng.randint(1000,9999):04d}")
-        res = list(orig); di = 0
-        for i,c in enumerate(res):
-            if c.isdigit() and di<len(new): res[i]=new[di]; di+=1
-        return "".join(res)
-
-    def fake_address(self, orig:str) -> str:
-        rng = self._rng(orig)
-        m = re.match(r"([A-Za-z ]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)", orig)
-        if m:
-            fc = self._fit(rng.choice(_CITIES), len(m.group(1).strip()))
-            fs = rng.choice(_STATES_L)
-            fz = self.fake_zip(m.group(3))
-            return _sl(f"{fc}, {fs} {fz}", orig)
-        toks = orig.split()
-        out = []
-        for i,t in enumerate(toks):
-            if i==0 and re.match(r'^\d+$',t):
-                n = rng.randint(10**(max(1,len(t)-1)), min(10**len(t)-1,99999))
-                out.append(_sl(str(n),t))
-            else:
-                out.append(self._fit(rng.choice(_STREETS+_STYPES+_CITIES), len(t)))
-        return " ".join(out)
-
-    def fake_account(self, orig:str) -> str:
-        rng = self._rng(orig)
-        res = list(orig)
-        for i,c in enumerate(res):
-            if c.isdigit(): res[i]=str(rng.randint(0,9))
-        return "".join(res)
-
-    def fake_date(self, orig:str) -> str:
-        rng = self._rng(orig)
-        y,m,d = rng.randint(1955,2005), rng.randint(1,12), rng.randint(1,28)
-        if re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", orig): r=f"{y:04d}-{m:02d}-{d:02d}"
-        elif re.match(r"\d{2}[/\-]\d{2}[/\-]\d{4}", orig): r=f"{m:02d}/{d:02d}/{y:04d}"
-        else: r=f"{y}-{m:02d}-{d:02d}"
-        return _sl(r, orig)
-
-    def fake_zip(self, orig:str) -> str:
-        rng = self._rng(orig)
-        res=list(orig)
-        for i,c in enumerate(res):
-            if c.isdigit(): res[i]=str(rng.randint(0,9))
-        return "".join(res)
-
-    def _scramble(self, orig:str) -> str:
-        rng = self._rng(orig); res=[]
-        for c in orig:
-            if c.isupper():   res.append(rng.choice("BCDFGHJKLMNPQRSTVWXYZ"))
-            elif c.islower(): res.append(rng.choice("bcdfghjklmnpqrstvwxyz"))
-            elif c.isdigit(): res.append(str(rng.randint(2,9)))
-            else: res.append(c)
-        return "".join(res)
-
-    def mask(self, orig:str, label:str) -> str:
-        key = f"{label}::{orig}"
-        if key in self._cache: return self._cache[key]
-        fn = {"SSN":self.fake_ssn,"EMAIL":self.fake_email,"PHONE":self.fake_phone,
-              "CREDIT_CARD":self.fake_account,"IP_ADDRESS":lambda o:".".join(
-                  str(self._rng(o).randint(1,253)) for _ in o.split(".")),
-              "DATE_OF_BIRTH":self.fake_date,"ROUTING_NUMBER":lambda o:self.fake_account(o),
-              "ZIP_CODE":self.fake_zip,"ADDRESS":self.fake_address,
-              "ACCOUNT_NUMBER":self.fake_account,"CLAIM_ID":self.fake_account,
-              "EIN":self.fake_account,"NPI":self.fake_account,
-              "NAME":self.fake_name,"ORG":self.fake_org,
-              }.get(label, self._scramble)
-        r = _sl(fn(orig), orig)
-        self._cache[key] = r
-        return r
-
-
-def _sl(r:str, orig:str) -> str:
-    if not r: return orig
-    if len(r)==len(orig): return r
-    return (r+r[-1]*(len(orig)-len(r)))[:len(orig)]
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Detection Layer 1 — Regex (unchanged)
-# ══════════════════════════════════════════════════════════════════════
-_REGEX = [
-    ("SSN",           r"\b(?!000|666)\d{3}[-\s.]\d{2}[-\s.]\d{4}\b"),
-    ("EMAIL",         r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,6}\b"),
-    ("PHONE",         r"(?:\+1[-.\s]?)?(?:\(\d{3}\)|\d{3})[-.\s]?\d{3}[-.\s]?\d{4}\b"),
-    ("CREDIT_CARD",   r"\b(?:\d[ \-]?){13,16}\b"),
-    ("DATE_OF_BIRTH", r"\b(?:(?:19|20)\d{2}[-/]\d{2}[-/]\d{2}|(?:0?[1-9]|1[0-2])[/\-]\d{2}[/\-](?:19|20)\d{2})\b"),
-    ("IP_ADDRESS",    r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"),
-    ("ACCOUNT_NUMBER",r"\b(?:ACCT|ACC|GRP|MBR|PLN|AUTH|CCN|NRB)[-\s]?[\w\-]{4,20}\b"),
-    ("CLAIM_ID",      r"\b(?:MC|RX|DN|VS|PRM|CRD)-\d{4,8}\b"),
-    ("EIN",           r"\b\d{2}-\d{7}\b"),
-    ("ROUTING_NUMBER",r"\b[0123]\d{8}\b"),
-    ("ZIP_CODE",      r"\b\d{5}(?:-\d{4})?\b"),
-    ("NPI",           r"\b\d{10}\b"),
-]
-_COMPILED = [(l,re.compile(p,re.I)) for l,p in _REGEX]
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Detection Layer 2 — ORG (rebuilt: strict suffix anchoring, no label context)
-# ══════════════════════════════════════════════════════════════════════
-# Words that appear before real org names in document labels — strip these
-_ORG_LABEL_WORDS = {
-    "carrier","administrator","payee","employer","group","bank","name","type",
-    "statement","provider","network","preferred","primary","care","pcp","date",
-    "financial","employer","description","reference","support","remit","to",
-}
-
-# Org-type suffixes that anchor a real organization name
-_ORG_SUFFIX_WORDS = {
-    "llc","inc","ltd","corp","lp","llp","pc","pllc","co",
-    "administration","associates","analytics","solutions","services",
-    "systems","consulting","technologies","enterprises","holdings",
-    "partners","networks","healthcare","diagnostics","imaging",
-    "practice","dental","vision","pharmacy","rehab","clinic","center",
-    "hospital","medical","laboratory","laboratories","federal","treasury",
-    "financial","bank","insurance","benefits","group","orthopedics",
-}
-
-# These two-word combos look like ORGs but are document headers
-_ORG_STOP_PHRASES = {
-    "statement type","ytd insurance","coverage utilization","pharmacy benefit",
-    "date financial","cost center","payroll division","prior balance",
-    "vision family","dental family","dental basic","dental preventive",
-    "vision exam","medical out","pocket max","plan year","cobra indicator",
-    "wellness credit","member responsibility","provider write","network savings",
-    "coordination benefits","adjustment reason","remark code","revenue code",
-    "diagnosis code","procedure code","appeal window","place service",
-}
-
-# Full known-org patterns — explicit, no over-matching
-_KNOWN_ORGS = re.compile(
-    r"\b(?:"
-    r"NorthRiver\s+(?:Benefits(?:\s+Administration)?|Urgent\s+Care)"
-    r"|Blue\s+Cedar\s+Analytics(?:\s+LLC)?"
-    r"|First\s+Federal\s+Treasury\s+Services"
-    r"|BrightSmile\s+Dental"
-    r"|CityLab\s+Diagnostics"
-    r"|West\s+End\s+Imaging"
-    r"|Downtown\s+Orthopedics"
-    r"|Metro\s+Rehab"
-    r"|North\s+Shore\s+Vision"
-    r"|Lakeview\s+(?:Family\s+Practice|Rx)"
-    r"|MailOrder\s+Central"
-    r"|SpecialtyHub"
-    r")\b",
-    re.I
-)
-
-# Generic org: 1-4 TitleCase words ENDING in a suffix word
-# Negative lookbehind: must not be preceded by a label word
-_ORG_GENERIC = re.compile(
-    r"\b(?:[A-Z][A-Za-z&]{1,25}\s+){0,3}[A-Z][A-Za-z&]{1,25}\s+"
-    r"(?:" + "|".join(sorted(_ORG_SUFFIX_WORDS, key=len, reverse=True)) + r")\b"
-)
-
-
-def _find_orgs(text:str) -> List[Tuple[int,int,str]]:
-    results = []
-    seen: Dict[Tuple,bool] = {}
-
-    def _add(s:int, e:int, v:str):
-        v = v.strip()
-        if not v or len(v) < 3: return
-        # Strip leading label-context words
-        words_in_v = v.split()
-        # Remove leading label words
-        while words_in_v and words_in_v[0].lower().rstrip(".:") in _ORG_LABEL_WORDS:
-            stripped = words_in_v[0]
-            words_in_v = words_in_v[1:]
-            s += len(stripped) + 1
-        if len(words_in_v) < 1: return
-        v = " ".join(words_in_v)
-        if not v: return
-        # Check it's not a stop phrase
-        low = v.lower()
-        for sp in _ORG_STOP_PHRASES:
-            if sp in low: return
-        key = (s, s+len(v))
-        if key not in seen:
-            seen[key] = True
-            results.append((s, s+len(v), v))
-
-    for m in _KNOWN_ORGS.finditer(text):
-        _add(m.start(), m.end(), m.group())
-    for m in _ORG_GENERIC.finditer(text):
-        _add(m.start(), m.end(), m.group())
-
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Detection Layer 3 — Person Names (strict, no stop words)
-# ══════════════════════════════════════════════════════════════════════
-_NAME_STOP = {
-    "invoice","header","number","date","period","billing","employer","group",
-    "policyholder","policy","account","member","address","full","residential",
-    "mailing","country","bank","amounts","due","summary","category","ytd",
-    "count","amount","remaining","notes","subtotal","tax","fees","net","remit",
-    "payee","payment","method","reference","support","administration","statement",
-    "carrier","benefits","year","premium","claims","detail","coverage",
-    "utilization","snapshot","financial","total","plan","paid","responsibility",
-    "provider","network","deductible","indicator","wellness","credit","document",
-    "intelligence","hints","recent","line","items","service","description",
-    "claim","billed","allowed","status","adjustments","credits","savings",
-    "coordination","representative","fields","control","authorization",
-    "rendering","place","revenue","code","diagnosis","procedure","reason",
-    "remark","appeal","window","fax","machine","readable","extraction",
-    "targets","item","currency","compliance","notice","data","classification",
-    "sensitive","included","labels","downstream","testing","primary","entities",
-    "vendor","insured","dependents","banking","totals","pending","lockbox",
-    "wire","beneficiary","checks","payable","ach","company","format","preferred",
-    "customer","generic","specialty","mail","order","retail","fills","supply",
-    "pricing","tier","mix","annual","maximum","dental","medical","pharmacy",
-    "vision","benefit","preventive","basic","standard","family","relationship",
-    "subscriber","covered","person","spouse","child","dependent","pocket","max",
-    "urgent","care","federal","treasury","fluticasone","spray","crown","prep",
-    "remittance","advice","stub","adjustment","adjustment","reason","fax",
-    "rendering","coordination","duplicate","reversal","network","savings",
-    "participation","services","health","clinical","review","documentation",
-    "patient","provider","insurer","carrier","quarter","billed","allowed",
-    "resp","posted","applied","visit","panel","exam","filling","cleaning",
-    "lenses","session","office","rollover","cobra","formulary","copay",
-    "coinsurance","deductible","out","in","ytd","pcp","payroll","division",
-    "cost","center","platforms","data","hr","contact","type","other","prior",
-    # months and days
-    "january","february","march","april","june","july","august","september",
-    "october","november","december","monday","tuesday","wednesday","thursday",
-    "friday","saturday","sunday",
-    # common single-word false-matches
-    "no","id","po","dr","st","rd","ave","blvd","ct","ln","pl","synthetic",
-    "fictional","information",
-}
-
-_STRICT_NAME_RE = re.compile(
-    r'(?:(?:Dr|Mr|Mrs|Ms|Prof)\.?\s+)?'
-    r'(?<![A-Za-z])([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})(?:\s+([A-Z][a-z]{1,20}))?(?![A-Za-z])'
-)
-
-
-def _find_persons(text:str) -> List[Tuple[int,int,str]]:
-    results = []
-    for m in _STRICT_NAME_RE.finditer(text):
-        parts = [g for g in [m.group(1), m.group(2), m.group(3)] if g]
-        if not all(re.match(r'^[A-Za-z]+$', p) for p in parts):
-            continue
-        # Drop stop-word 3rd token, try 2-word fallback
-        if len(parts)==3 and parts[2].lower() in _NAME_STOP:
-            parts = parts[:2]
-        if any(p.lower() in _NAME_STOP for p in parts):
-            continue
-        if len(parts) < 2:
-            continue
-        v = " ".join(parts)
-        results.append((m.start(), m.start()+len(v), v))
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Detection Layer 4 — Label:Value context  (NEW in v5)
-#  Catches "Submitted By: John Smith", "Policyholder: Aarav Mehta", etc.
-# ══════════════════════════════════════════════════════════════════════
-_NAME_LABELS = re.compile(
-    r'\b(?:submitted\s+by|policyholder(?:\s+name)?|full\s+name|patient(?:\s+name)?'
-    r'|insured(?:\s+name)?|member(?:\s+name)?|employee(?:\s+name)?|applicant'
-    r'|primary\s+subscriber|subscriber(?:\s+name)?|dependent\s+\d+'
-    r'|claimant|beneficiary|authorized\s+by|prepared\s+by|signed\s+by'
-    r'|primary\s+care|pcp|rendering\s+provider|attending\s+physician'
-    r'|patient|guardian|contact(?:\s+person)?|name)\s*[:\-]\s*',
-    re.I
-)
-
-# Name-value: 1-3 TitleCase words after the label
-_NAME_VAL_RE = re.compile(r'([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})')
-
-
-def _find_label_names(text:str) -> List[Tuple[int,int,str]]:
-    """Find names that appear as values after name-field labels."""
-    results = []
-    for m in _NAME_LABELS.finditer(text):
-        # Look at what follows the label+colon
-        rest = text[m.end():m.end()+60]
-        vm = _NAME_VAL_RE.match(rest)
-        if vm:
-            v = vm.group(1).strip()
-            words = v.split()
-            # Must be 2+ words, none in stop list
-            if len(words) >= 2 and not any(w.lower() in _NAME_STOP for w in words):
-                s = m.end()
-                results.append((s, s+len(v), v))
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Detection Layer 5 — Address
-# ══════════════════════════════════════════════════════════════════════
-_ADDR_SUFX = {"st","street","ave","avenue","blvd","boulevard","rd","road",
-              "ln","lane","dr","drive","ct","court","pl","place","way",
-              "cir","circle","hwy","highway","pkwy","parkway","ter","terrace"}
-_US_ST = {"AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
-          "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
-          "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
-          "TX","UT","VT","VA","WA","WV","WI","WY","DC"}
-
-_STREET_RE = re.compile(
-    r'\b\d{2,5}\s+(?:[A-Za-z]+\s+){0,4}'
-    r'(?:'+"|".join(_ADDR_SUFX)+r')(?:\.|\b)'
-    r'(?:,?\s*[A-Za-z\s]{2,25})?(?:,?\s*(?:'+"|".join(_US_ST)+r'))?'
-    r'(?:\s+\d{5}(?:-\d{4})?)?', re.I
-)
-_CITYSTATE_RE = re.compile(
-    r'\b([A-Z][a-z]{2,20}(?:\s+[A-Z][a-z]{2,20})?),\s*('
-    +"|".join(_US_ST)+r')(?:\s+(\d{5}(?:-\d{4})?))?'
-)
-_POBOX_RE = re.compile(r'\bP\.?\s*O\.?\s*Box\s+\d{3,6}\b', re.I)
-
-
-def _find_addresses(text:str) -> List[Tuple[int,int,str]]:
-    results = []
-    for m in _STREET_RE.finditer(text):
-        results.append((m.start(), m.start()+len(m.group().strip()), m.group().strip()))
-    for m in _CITYSTATE_RE.finditer(text):
-        results.append((m.start(), m.end(), m.group().strip()))
-    for m in _POBOX_RE.finditer(text):
-        results.append((m.start(), m.end(), m.group().strip()))
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Orchestrator
-# ══════════════════════════════════════════════════════════════════════
-@dataclasses.dataclass
-class PIIMatch:
-    label:str; original:str; masked:str; start:int; end:int
-
-
-def _overlaps(s,e,occ): return any(s<oe and e>os for os,oe in occ)
-
-
-def detect_pii(text:str, faker:RealisticFaker) -> List[PIIMatch]:
-    occ: List[Tuple[int,int]] = []
-    acc = []
-
-    def add(s,e,orig,lbl):
-        o = orig.strip()
-        if not o or len(o)<2: return
-        lead = len(orig)-len(orig.lstrip())
-        ss,ee = s+lead, s+lead+len(o)
-        if not _overlaps(ss,ee,occ):
-            acc.append((ss,ee,o,lbl)); occ.append((ss,ee))
-
-    # 1. Regex
-    for lbl,rx in _COMPILED:
-        for m in sorted(rx.finditer(text), key=lambda x:(x.start(),-(x.end()-x.start()))):
-            add(m.start(),m.end(),m.group(),lbl)
-
-    # 2. ORG
-    for s,e,v in sorted(_find_orgs(text),key=lambda x:(x[0],-(x[1]-x[0]))):
-        add(s,e,v,"ORG")
-
-    # 3. Address (before names so street words don't become name matches)
-    for s,e,v in sorted(_find_addresses(text),key=lambda x:(x[0],-(x[1]-x[0]))):
-        add(s,e,v,"ADDRESS")
-
-    # 4. Label:Value names (high-confidence — explicit field context)
-    for s,e,v in sorted(_find_label_names(text),key=lambda x:(x[0],-(x[1]-x[0]))):
-        add(s,e,v,"NAME")
-
-    # 5. Person names (fills remaining gaps)
-    for s,e,v in sorted(_find_persons(text),key=lambda x:(x[0],-(x[1]-x[0]))):
-        add(s,e,v,"NAME")
-
-    acc.sort(key=lambda x:x[0])
-    return [PIIMatch(lbl,o,faker.mask(o,lbl),s,e) for s,e,o,lbl in acc]
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Box finder — token-match (from v3/v4)
-# ══════════════════════════════════════════════════════════════════════
-def _norm(s:str)->str: return re.sub(r"[\s\-./,()+]","",s).lower()
-
-def find_boxes(value:str, words:List[WBox]) -> List[WBox]:
+def _find_sw(value:str,words:List[SW])->List[SW]:
     if not value.strip(): return []
-    vn = _norm(value)
+    def _n(s): return re.sub(r"[\s\-./,()+@]","",s).lower()
+    vn=_n(value)
     if not vn: return []
-
-    # Pass 1: single word exact/normalized
     for w in words:
-        if w.text.strip()==value.strip() or _norm(w.text)==vn:
-            return [w]
-
-    # Pass 2: sliding window
-    for win in range(1, min(9,len(words)+1)):
+        if w.text==value.strip() or _n(w.text)==vn: return [w]
+    for win in range(1,min(9,len(words)+1)):
         for i in range(len(words)-win+1):
-            grp = words[i:i+win]
-            combined = " ".join(w.text for w in grp)
-            cn = _norm(combined)
+            grp=words[i:i+win]; tops=[w.top for w in grp]
+            if max(tops)-min(tops)>22: continue
+            combined=" ".join(w.text for w in grp); cn=_n(combined)
             if not cn or len(cn)<2: continue
             if vn in cn or (cn in vn and len(cn)>=max(4,len(vn)//2)) or value.strip() in combined:
-                tops=[w.top for w in grp]
-                if max(tops)-min(tops)<22: return grp
-
-    # Pass 3: token matching
-    vtoks=[t for t in re.split(r'[\s]+',value.strip()) if len(t)>2]
+                return grp
+    vtoks=[t for t in re.split(r"[\s]+",value.strip()) if len(t)>2]
     if len(vtoks)>=2:
-        found, pool = [], {i:w for i,w in enumerate(words)}
+        found=[]; pool={i:w for i,w in enumerate(words)}
         for vt in vtoks:
-            vtn=_norm(vt)
+            vtn=_n(vt)
             for i,w in list(pool.items()):
-                if _norm(w.text)==vtn or vtn in _norm(w.text):
-                    found.append(w); del pool[i]; break
+                if _n(w.text)==vtn or vtn in _n(w.text): found.append(w); del pool[i]; break
         if len(found)>=max(1,len(vtoks)//2):
             tops=[b.top for b in found]
             if not found or max(tops)-min(tops)<30: return found
-
-    # Pass 4: significant substring
     vc=value.strip().replace(" ","")
     for w in words:
         wc=w.text.replace(" ","")
-        if len(wc)>=4 and (vc in wc or (wc in vc and len(wc)>=max(4,len(vc)//3))):
-            return [w]
+        if len(wc)>=4 and (vc in wc or (wc in vc and len(wc)>=max(4,len(vc)//3))): return [w]
     return []
 
+# ── Redact ───────────────────────────────────────────────────────────
+def _c255(c): return tuple(min(255,max(0,int(v*255))) for v in c[:3])
 
-# ══════════════════════════════════════════════════════════════════════
-#  Visual Redaction — font-matched rendering  (v5 core fix)
-# ══════════════════════════════════════════════════════════════════════
-def redact_and_replace(img:Image.Image, boxes:List[WBox], masked_text:str,
-                       scale:float, bg_color=(248,248,248)) -> Image.Image:
-    """
-    Whiteout the word boxes and draw masked_text in LiberationSans
-    at a font size derived from the original PDF char metrics.
-    This makes replaced text visually match the surrounding text.
-    """
+def redact(img,boxes,masked,scale):
     if not boxes: return img
-    draw = ImageDraw.Draw(img)
-    PAD = 2
-
-    x0 = min(b.x0 for b in boxes);   y0 = min(b.top    for b in boxes)
-    x1 = max(b.x1 for b in boxes);   y1 = max(b.bottom for b in boxes)
-    bold = any(b.bold for b in boxes)
-
-    # Convert PDF pt size → screen pixels at render scale
-    # PDF: 1 pt = 1/72 inch. At 72 DPI, 1pt = 1px. At scale×72 DPI, 1pt = scale px.
-    pdf_pt_size = max(b.font_size for b in boxes) if boxes else 9.0
-    font_px = max(6, int(pdf_pt_size * scale))
-
+    draw=ImageDraw.Draw(img); PAD=1
+    x0=min(b.x0 for b in boxes); y0=min(b.top for b in boxes)
+    x1=max(b.x1 for b in boxes); y1=max(b.bottom for b in boxes)
+    sz=boxes[0].size; bold=boxes[0].bold; col=boxes[0].color
+    fpx=max(6,int(sz*scale)); tc=_c255(col)
     px0=int(x0*scale)-PAD; py0=int(y0*scale)-PAD
     px1=int(x1*scale)+PAD; py1=int(y1*scale)+PAD
-    box_w = px1-px0; box_h = py1-py0
-
-    # Whiteout
-    draw.rectangle([px0, py0, px1, py1], fill=bg_color)
-
-    if not masked_text.strip(): return img
-
-    text_to_draw = masked_text.strip()
-
-    # Try font at derived size, shrink if text overflows box width
-    for attempt in range(font_px, 5, -1):
-        f = get_font(attempt, bold)
-        try:
-            bbox = draw.textbbox((0,0), text_to_draw, font=f)
-            tw = bbox[2]-bbox[0]
-        except Exception:
-            tw = len(text_to_draw) * attempt * 0.55
-        if tw <= box_w + 4:
-            font_px = attempt
-            break
-
-    font = get_font(font_px, bold)
-
-    # Vertical center in box
-    try:
-        tbbox = draw.textbbox((0,0), text_to_draw, font=font)
-        th = tbbox[3]-tbbox[1]
-    except Exception:
-        th = font_px
-    ty = py0 + max(0, (box_h - th)//2)
-
-    draw.text((px0+1, ty), text_to_draw, fill=(15,15,15), font=font)
+    bw=px1-px0; bh=py1-py0
+    draw.rectangle([px0,py0,px1,py1],fill=(255,255,255))
+    if not masked.strip(): return img
+    for a in range(fpx,5,-1):
+        f=_font(a,bold)
+        try: tw=draw.textbbox((0,0),masked.strip(),font=f)[2]
+        except: tw=len(masked)*a*0.55
+        if tw<=bw+6: fpx=a; break
+    f=_font(fpx,bold)
+    try: th=draw.textbbox((0,0),masked.strip(),font=f)[3]
+    except: th=fpx
+    ty=py0+max(0,(bh-th)//2)
+    draw.text((px0+1,ty),masked.strip(),fill=tc,font=f)
     return img
 
+# ── Fake-data ────────────────────────────────────────────────────────
+_FN=["James","Robert","Michael","William","David","Richard","Joseph","Thomas",
+     "Mary","Patricia","Jennifer","Linda","Barbara","Elizabeth","Susan",
+     "Jessica","Sarah","Karen","Lisa","Nancy","Betty","Emily","Ashley",
+     "Liam","Noah","Sophia","Emma","Olivia","Ava","Isabella","Charlotte"]
+_LN=["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis",
+     "Rodriguez","Martinez","Lopez","Wilson","Anderson","Taylor","Moore",
+     "Jackson","Martin","Lee","Perez","Thompson","White","Harris","Clark",
+     "Ramirez","Lewis","Robinson","Walker","Young","King","Wright","Scott"]
+_SN=["Oak","Maple","Cedar","Pine","Elm","Washington","Lincoln","Highland",
+     "Riverside","Meadow","Valley","Ridge","Lake","Spring","Prairie"]
+_ST=["Street","Avenue","Boulevard","Road","Lane","Drive","Court","Place"]
+_CT=["Springfield","Franklin","Clinton","Salem","Fairview","Madison",
+     "Arlington","Burlington","Greenville","Newport","Bristol","Lakewood"]
+_SA=["AL","AZ","CA","CO","CT","FL","GA","IL","IN","KY","LA","MD","MA","MI",
+     "MN","MO","NJ","NY","NC","OH","OR","PA","TN","TX","VA","WA","WI"]
+_ED=["gmail","yahoo","outlook","icloud","hotmail","protonmail","fastmail"]
+_OP=["Blue","Green","First","National","United","Premier","Global","Pacific",
+     "Atlantic","Central","Summit","Apex","Sterling","Meridian","Heritage"]
+_OT=["Analytics","Solutions","Services","Group","Systems","Consulting",
+     "Technologies","Healthcare","Diagnostics","Imaging","Practice",
+     "Dental","Vision","Pharmacy","Rehab","Clinic","Center","Hospital"]
 
-# ══════════════════════════════════════════════════════════════════════
-#  Main Pipeline
-# ══════════════════════════════════════════════════════════════════════
-def process_pdf(input_path:str, output_path:str,
-                scale:float=2.0, seed:int=42, report:bool=True):
-    input_path  = Path(input_path)
-    output_path = Path(output_path)
-    faker = RealisticFaker(seed=seed)
-    log.info("Opening: %s  scale=%.1f", input_path, scale)
+class Faker:
+    def __init__(self,s=42): self._s=s; self._c={}
+    def _r(self,k): return random.Random(int(hashlib.md5((str(self._s)+k).encode()).hexdigest(),16)&0xFFFFFFFF)
+    def _f(self,w,n):
+        w=w.strip() or "X"
+        if len(w)>=n: return w[:n].capitalize()
+        p="abcdefghijklmnopqrstuvwxyz"
+        while len(w)<n: w+=p[len(w)%len(p)]
+        return w.capitalize()
+    def _l(self,s,n):
+        s=s.strip() or "x"
+        if len(s)>=n: return s[:n]
+        while len(s)<n: s+=s[-1]
+        return s
+    def name(self,o):
+        r=self._r(o)
+        return " ".join(self._f(r.choice(_FN+_LN),len(p)) for p in o.split())
+    def org(self,o):
+        r=self._r(o); pool=_OP+_OT+_CT
+        return " ".join(p if p.upper() in{"LLC","INC","LTD","CORP","LP","LLP","PC","PLLC"}
+                        else self._f(r.choice(pool),len(p)) for p in o.split())
+    def ssn(self,o):
+        r=self._r(o); sep="." if "." in o else (" " if " " in o and "-" not in o else "-")
+        return _sl(f"9{r.randint(10,99):02d}{sep}{r.randint(10,99):02d}{sep}{r.randint(1000,9999):04d}",o)
+    def email(self,o):
+        r=self._r(o); c=re.split(r'\n|\s{2,}',o)[0].strip()
+        m=re.match(r"(.+)@(.+)\.([A-Za-z]{2,})",c)
+        if not m: return self._scr(o)
+        return _sl(f"{self._l(r.choice(_FN).lower()+'.'+r.choice(_LN).lower(),len(m.group(1)))}@{self._l(r.choice(_ED),len(m.group(2)))}.{m.group(3)}",o)
+    def phone(self,o):
+        r=self._r(o); new=list(f"{r.randint(201,989):03d}{r.randint(200,999):03d}{r.randint(1000,9999):04d}")
+        res=list(o); di=0
+        for i,c in enumerate(res):
+            if c.isdigit() and di<len(new): res[i]=new[di]; di+=1
+        return "".join(res)
+    def addr(self,o):
+        r=self._r(o)
+        m=re.match(r"([A-Za-z ]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)",o)
+        if m: return _sl(f"{self._f(r.choice(_CT),len(m.group(1).strip()))}, {r.choice(_SA)} {self.zipf(m.group(3))}",o)
+        toks=o.split(); out=[]
+        for i,t in enumerate(toks):
+            if i==0 and re.match(r'^\d+$',t): out.append(_sl(str(r.randint(10**(max(1,len(t)-1)),min(10**len(t)-1,99999))),t))
+            else: out.append(self._f(r.choice(_SN+_ST+_CT),len(t)))
+        return " ".join(out)
+    def acct(self,o):
+        r=self._r(o); res=list(o)
+        for i,c in enumerate(res):
+            if c.isdigit(): res[i]=str(r.randint(0,9))
+        return "".join(res)
+    def datef(self,o):
+        r=self._r(o); y,m,d=r.randint(1955,2005),r.randint(1,12),r.randint(1,28)
+        if re.match(r"\d{4}[-/]\d{2}[-/]\d{2}",o): rv=f"{y:04d}-{m:02d}-{d:02d}"
+        elif re.match(r"\d{2}[/\-]\d{2}[/\-]\d{4}",o): rv=f"{m:02d}/{d:02d}/{y:04d}"
+        else: rv=f"{y}-{m:02d}-{d:02d}"
+        return _sl(rv,o)
+    def zipf(self,o):
+        r=self._r(o); res=list(o)
+        for i,c in enumerate(res):
+            if c.isdigit(): res[i]=str(r.randint(0,9))
+        return "".join(res)
+    def _scr(self,o):
+        r=self._r(o); res=[]
+        for c in o:
+            if c.isupper(): res.append(r.choice("BCDFGHJKLMNPQRSTVWXYZ"))
+            elif c.islower(): res.append(r.choice("bcdfghjklmnpqrstvwxyz"))
+            elif c.isdigit(): res.append(str(r.randint(2,9)))
+            else: res.append(c)
+        return "".join(res)
+    def mask(self,o,l):
+        k=f"{l}::{o}"
+        if k in self._c: return self._c[k]
+        fn={"SSN":self.ssn,"EMAIL":self.email,"PHONE":self.phone,
+            "DATE_OF_BIRTH":self.datef,"ROUTING_NUMBER":self.acct,
+            "ZIP_CODE":self.zipf,"ADDRESS":self.addr,
+            "ACCOUNT_NUMBER":self.acct,"CLAIM_ID":self.acct,
+            "EIN":self.acct,"NPI":self.acct,"CREDIT_CARD":self.acct,
+            "IP_ADDRESS":lambda x:".".join(str(self._r(x).randint(1,253)) for _ in x.split(".")),
+            "NAME":self.name,"ORG":self.org}.get(l,self._scr)
+        r=_sl(fn(o),o); self._c[k]=r; return r
 
-    plumber_pdf = pdfplumber.open(str(input_path))
-    pdfium_doc  = pdfium.PdfDocument(str(input_path))
-    pages_out, summary = [], {}
-    total_det = total_drawn = 0
+def _sl(r,o):
+    if not r: return o
+    if len(r)==len(o): return r
+    return (r+r[-1]*(len(o)-len(r)))[:len(o)]
 
-    for idx, pl_page in enumerate(plumber_pdf.pages):
-        log.info("  Page %d/%d", idx+1, len(plumber_pdf.pages))
-        img = pdfium_doc[idx].render(scale=scale, rotation=0).to_pil().convert("RGB")
+# ── Detection ────────────────────────────────────────────────────────
+_RX=[("SSN",r"\b(?!000|666)\d{3}[-\s.]\d{2}[-\s.]\d{4}\b"),
+     ("EMAIL",r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,6}\b"),
+     ("PHONE",r"(?:\+1[-.\s]?)?(?:\(\d{3}\)|\d{3})[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+     ("CREDIT_CARD",r"\b(?:\d[ \-]?){13,16}\b"),
+     ("DATE_OF_BIRTH",r"\b(?:(?:19|20)\d{2}[-/]\d{2}[-/]\d{2}|(?:0?[1-9]|1[0-2])[/\-]\d{2}[/\-](?:19|20)\d{2})\b"),
+     ("IP_ADDRESS",r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"),
+     ("ACCOUNT_NUMBER",r"\b(?:ACCT|ACC|GRP|MBR|PLN|AUTH|CCN|NRB)[-\s]?[\w\-]{4,20}\b"),
+     ("CLAIM_ID",r"\b(?:MC|RX|DN|VS|PRM|CRD)-\d{4,8}\b"),
+     ("EIN",r"\b\d{2}-\d{7}\b"),
+     ("ROUTING_NUMBER",r"\b[0123]\d{8}\b"),
+     ("ZIP_CODE",r"\b\d{5}(?:-\d{4})?\b"),
+     ("NPI",r"\b\d{10}\b")]
+_CRX=[(l,re.compile(p,re.I)) for l,p in _RX]
 
-        raw = pl_page.extract_text(layout=False) or ""
-        text = re.sub(r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+)\.\n([A-Za-z]{2,})',
-                      lambda m: m.group(1)+"."+m.group(2), raw)
+_OSTRIP={"carrier","administrator","payee","employer","group","bank","name","type",
+    "statement","provider","network","preferred","primary","care","pcp","date",
+    "financial","description","reference","support","remit","to","by","from",
+    "submitted","issued","prepared","authorized","signed","attending","rendering"}
+_OSUFX={"llc","inc","ltd","corp","lp","llp","pc","pllc","administration",
+    "associates","analytics","solutions","services","systems","consulting",
+    "technologies","enterprises","healthcare","diagnostics","imaging",
+    "practice","dental","vision","pharmacy","rehab","clinic","center",
+    "hospital","medical","laboratory","laboratories","federal","treasury",
+    "financial","bank","insurance","benefits","group","orthopedics"}
+_OSTOP={"statement type","ytd insurance","coverage utilization","policy number",
+    "policy information","account number","member id","invoice number","invoice date",
+    "billing period","due date","employer group","group number","invoice header",
+    "prior balance","vision family","dental family","dental basic","dental preventive",
+    "vision exam","medical out","pocket max","plan year","cobra indicator",
+    "wellness credit","member responsibility","provider write","network savings",
+    "adjustment reason","remark code","revenue code","diagnosis code","procedure code",
+    "appeal window","date financial","cost center","payroll division",
+    "document intelligence","preferred network","preferred pharmacy",
+    "fictional insurance","synthetic sensitive","compliance notice"}
+_KNOWN=re.compile(
+    r"\b(?:NorthRiver\s+(?:Benefits(?:\s+Administration)?|Urgent\s+Care)"
+    r"|Blue\s+Cedar\s+Analytics(?:\s+LLC)?|First\s+Federal\s+Treasury\s+Services"
+    r"|BrightSmile\s+Dental|CityLab\s+Diagnostics|West\s+End\s+Imaging"
+    r"|Downtown\s+Orthopedics|Metro\s+Rehab|North\s+Shore\s+Vision"
+    r"|Lakeview\s+(?:Family\s+Practice|Rx)|NorthRiver\s+Urgent\s+Care"
+    r"|MailOrder\s+Central|SpecialtyHub)\b",re.I)
+_OGEN=re.compile(r"\b(?:[A-Z][A-Za-z&]{1,25}\s+){0,3}[A-Z][A-Za-z&]{1,25}\s+"
+    r"(?:"+"|".join(sorted(_OSUFX,key=len,reverse=True))+r")\b")
 
-        if not text.strip():
-            pages_out.append(img); continue
+def _orgs(text):
+    seen={}; res=[]
+    def add(s,e,v):
+        v=v.strip()
+        if not v: return
+        ws=v.split()
+        while ws and ws[0].lower().rstrip(".:") in _OSTRIP: s+=len(ws[0])+1; ws=ws[1:]
+        if not ws: return
+        v=" ".join(ws); lv=v.lower()
+        for sp in _OSTOP:
+            if lv.startswith(sp) or lv==sp: return
+        k=(s,s+len(v))
+        if k not in seen: seen[k]=True; res.append((s,s+len(v),v))
+    for m in _KNOWN.finditer(text): add(m.start(),m.end(),m.group())
+    for m in _OGEN.finditer(text): add(m.start(),m.end(),m.group())
+    return res
 
-        matches = detect_pii(text, faker)
-        summary[idx+1] = matches
-        total_det += len(matches)
+_LBPAT=re.compile(
+    r"\b(?:submitted\s+by|policyholder(?:\s+name)?|full\s+name"
+    r"|patient(?:\s+name)?|insured(?:\s+name)?|member(?:\s+name)?"
+    r"|employee(?:\s+name)?|applicant|primary\s+subscriber"
+    r"|subscriber(?:\s+name)?|claimant|beneficiary"
+    r"|authorized\s+by|prepared\s+by|signed\s+by|issued\s+to"
+    r"|attending\s+physician|rendering\s+provider"
+    r"|client(?:\s+name)?|customer(?:\s+name)?"
+    r"|guardian|dependent\s+\d+|dependent)\s*[:\-]\s*",re.I)
+_LBVAL=re.compile(r"([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){0,2})")
 
-        words = _get_words(pl_page)
-        drawn = 0
+_NSTOP={"invoice","header","number","date","period","billing","employer","group",
+    "policyholder","policy","account","member","address","full","residential",
+    "mailing","country","bank","amounts","due","summary","category","ytd","count",
+    "amount","remaining","notes","subtotal","tax","fees","net","remit","payee",
+    "payment","method","reference","support","administration","statement","carrier",
+    "benefits","year","premium","claims","detail","coverage","utilization",
+    "snapshot","financial","total","plan","paid","responsibility","provider",
+    "network","deductible","indicator","wellness","credit","document","intelligence",
+    "hints","recent","line","items","service","description","claim","billed",
+    "allowed","status","adjustments","credits","savings","coordination",
+    "representative","fields","control","authorization","rendering","place",
+    "revenue","code","diagnosis","procedure","reason","remark","appeal","window",
+    "fax","machine","readable","extraction","targets","item","currency",
+    "compliance","notice","data","classification","sensitive","included","labels",
+    "downstream","testing","primary","entities","vendor","insured","dependents",
+    "banking","totals","pending","lockbox","wire","beneficiary","checks","payable",
+    "ach","company","format","preferred","customer","generic","specialty","mail",
+    "order","retail","fills","supply","pricing","tier","mix","annual","maximum",
+    "dental","medical","pharmacy","vision","benefit","preventive","basic",
+    "standard","family","relationship","subscriber","covered","person","spouse",
+    "child","dependent","pocket","max","urgent","care","federal","treasury",
+    "fluticasone","spray","crown","prep","remittance","advice","stub","adjustment",
+    "duplicate","reversal","participation","services","health","clinical","review",
+    "documentation","patient","insurer","quarter","resp","posted","applied",
+    "visit","panel","exam","filling","cleaning","lenses","session","office",
+    "rollover","cobra","formulary","copay","coinsurance","out","in","pcp",
+    "payroll","division","cost","center","platforms","hr","contact","type","prior",
+    "balance","information","section","general","certificate","identification",
+    "january","february","march","april","june","july","august","september",
+    "october","november","december","monday","tuesday","wednesday","thursday",
+    "friday","saturday","sunday","no","id","po","st","rd","ave","blvd","ct",
+    "ln","pl","synthetic","fictional"}
+_NRE=re.compile(
+    r'(?:(?:Dr|Mr|Mrs|Ms|Prof)\.?\s+)?'
+    r'(?<![A-Za-z])([A-Z][a-z]{1,20})\s+([A-Z][a-z]{1,20})(?:\s+([A-Z][a-z]{1,20}))?(?![A-Za-z])')
 
+def _label_names(text):
+    res=[]
+    for m in _LBPAT.finditer(text):
+        rest=text[m.end():m.end()+60]
+        vm=_LBVAL.match(rest)
+        if vm:
+            v=vm.group(1).strip(); ws=v.split()
+            if len(ws)>=2 and not any(w.lower() in _NSTOP for w in ws):
+                s=m.end(); res.append((s,s+len(v),v))
+    return res
+
+def _persons(text):
+    res=[]
+    for m in _NRE.finditer(text):
+        parts=[g for g in [m.group(1),m.group(2),m.group(3)] if g]
+        if not all(re.match(r'^[A-Za-z]+$',p) for p in parts): continue
+        if len(parts)==3 and parts[2].lower() in _NSTOP: parts=parts[:2]
+        if any(p.lower() in _NSTOP for p in parts): continue
+        if len(parts)<2: continue
+        v=" ".join(parts); res.append((m.start(),m.start()+len(v),v))
+    return res
+
+_ASTOP={"st","street","ave","avenue","blvd","boulevard","rd","road",
+        "ln","lane","dr","drive","ct","court","pl","place","way",
+        "cir","circle","hwy","highway","pkwy","parkway","ter","terrace"}
+_USS={"AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
+      "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
+      "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
+      "TX","UT","VT","VA","WA","WV","WI","WY","DC"}
+_STRE=re.compile(r'\b\d{2,5}\s+(?:[A-Za-z]+\s+){0,4}(?:'+"|".join(_ASTOP)+r')(?:\.|\b)'
+    r'(?:,?\s*[A-Za-z\s]{2,25})?(?:,?\s*(?:'+"|".join(_USS)+r'))?(?:\s+\d{5}(?:-\d{4})?)?',re.I)
+_CSTE=re.compile(r'\b([A-Z][a-z]{2,20}(?:\s+[A-Z][a-z]{2,20})?),\s*('+"|".join(_USS)+r')(?:\s+(\d{5}(?:-\d{4})?))?')
+_PBXE=re.compile(r'\bP\.?\s*O\.?\s*Box\s+\d{3,6}\b',re.I)
+
+def _addrs(text):
+    res=[]
+    for m in _STRE.finditer(text): res.append((m.start(),m.start()+len(m.group().strip()),m.group().strip()))
+    for m in _CSTE.finditer(text): res.append((m.start(),m.end(),m.group().strip()))
+    for m in _PBXE.finditer(text): res.append((m.start(),m.end(),m.group().strip()))
+    return res
+
+@dataclasses.dataclass
+class PM:
+    label:str; original:str; masked:str; start:int; end:int
+
+def _ov(s,e,occ): return any(s<oe and e>os for os,oe in occ)
+
+def detect_pii(text:str,faker:Faker)->List[PM]:
+    occ=[]; acc=[]
+    def add(s,e,o,l):
+        orig=o.strip()
+        if not orig or len(orig)<2: return
+        ld=len(o)-len(o.lstrip()); ss,ee=s+ld,s+ld+len(orig)
+        if not _ov(ss,ee,occ): acc.append((ss,ee,orig,l)); occ.append((ss,ee))
+    for l,rx in _CRX:
+        for m in sorted(rx.finditer(text),key=lambda x:(x.start(),-(x.end()-x.start()))): add(m.start(),m.end(),m.group(),l)
+    for s,e,v in sorted(_orgs(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"ORG")
+    for s,e,v in sorted(_addrs(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"ADDRESS")
+    for s,e,v in sorted(_label_names(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"NAME")
+    for s,e,v in sorted(_persons(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"NAME")
+    acc.sort(key=lambda x:x[0])
+    return [PM(l,o,faker.mask(o,l),s,e) for s,e,o,l in acc]
+
+# ── OCR ──────────────────────────────────────────────────────────────
+def _ocr(img,faker):
+    if not TESS: log.warning("pytesseract missing"); return img
+    import pytesseract
+    draw=ImageDraw.Draw(img)
+    data=pytesseract.image_to_data(img,output_type=pytesseract.Output.DICT,lang="eng",config="--psm 6")
+    n=len(data["text"])
+    words=[(data["text"][i],data["left"][i],data["top"][i],data["width"][i],data["height"][i])
+           for i in range(n) if data["text"][i].strip() and int(data["conf"][i])>30]
+    if not words: return img
+    full=" ".join(w[0] for w in words)
+    matches=detect_pii(full,faker)
+    cursor=0; wpos=[]
+    for txt,l,t,w,h in words:
+        idx=full.find(txt,cursor)
+        if idx>=0: wpos.append((idx,idx+len(txt),l,t,w,h)); cursor=idx+len(txt)
+    for m in matches:
+        hits=[wp for wp in wpos if wp[0]<m.end and wp[1]>m.start]
+        if not hits: continue
+        x0=min(wp[2] for wp in hits); y0=min(wp[3] for wp in hits)
+        x1=max(wp[2]+wp[4] for wp in hits); y1=max(wp[3]+wp[5] for wp in hits)
+        bw=x1-x0; bh=y1-y0
+        draw.rectangle([x0-1,y0-1,x1+1,y1+1],fill=(255,255,255))
+        sz=max(6,int(bh*0.72))
+        for a in range(sz,5,-1):
+            f=_font(a,False)
+            try: tw=draw.textbbox((0,0),m.masked,font=f)[2]
+            except: tw=len(m.masked)*a*0.55
+            if tw<=bw+4: sz=a; break
+        draw.text((x0+1,y0+1),m.masked,fill=(0,0,0),font=_font(sz,False))
+        log.debug("  OCR [%s] %r→%r",m.label,m.original,m.masked)
+    return img
+
+# ── Pipeline ─────────────────────────────────────────────────────────
+def process_pdf(inp,out,scale=2.0,seed=42,report=True):
+    inp=Path(inp); out=Path(out); faker=Faker(seed)
+    log.info("Opening: %s  scale=%.1f",inp,scale)
+    plb=pdfplumber.open(str(inp)); pdc=pdfium.PdfDocument(str(inp))
+    pages=[]; summary={}; td=tdr=0
+    for idx,pl in enumerate(plb.pages):
+        log.info("  Page %d/%d",idx+1,len(plb.pages))
+        img=pdc[idx].render(scale=scale,rotation=0).to_pil().convert("RGB")
+        if len(pl.chars)<20:
+            log.info("    Image-based → OCR")
+            img=_ocr(img,faker); pages.append(img); continue
+        raw=pl.extract_text(layout=False) or ""
+        text=re.sub(r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+)\.\n([A-Za-z]{2,})',
+                    lambda m:m.group(1)+"."+m.group(2),raw)
+        matches=detect_pii(text,faker); summary[idx+1]=matches; td+=len(matches)
+        if not matches: pages.append(img); continue
+        sw=_build_sw(pl); drawn=0
         for m in matches:
-            boxes = find_boxes(m.original, words)
-            if not boxes:
-                for run in re.findall(r'[A-Za-z0-9]{4,}', m.original):
-                    for w in words:
-                        if run.lower() in w.text.lower() and len(w.text)>=3:
-                            boxes=[w]; break
-                    if boxes: break
+            boxes=_find_sw(m.original,sw)
             if boxes:
-                img = redact_and_replace(img, boxes, m.masked, scale)
-                drawn += 1
-                log.debug("    [%-16s] %r → %r", m.label, m.original, m.masked)
+                img=redact(img,boxes,m.masked,scale); drawn+=1
+                log.debug("  [%-14s] %r→%r  sz=%.1f",m.label,m.original,m.masked,boxes[0].size)
             else:
-                log.warning("    NO BOX [%s]: %r", m.label, m.original)
-
-        total_drawn += drawn
-        log.info("    detected=%d  drawn=%d/%d", len(matches), drawn, len(matches))
-        pages_out.append(img)
-
-    plumber_pdf.close(); pdfium_doc.close()
-
-    log.info("Saving → %s", output_path)
-    rgb = [i.convert("RGB") for i in pages_out]
-    rgb[0].save(str(output_path), save_all=True, append_images=rgb[1:], resolution=150)
-    log.info("DONE — detected=%d  drawn=%d  pages=%d",
-             total_det, total_drawn, len(pages_out))
-
-    if report: _print_report(summary, total_drawn, total_det)
+                log.warning("  NO BOX [%s]: %r",m.label,m.original)
+        tdr+=drawn; log.info("    detected=%d drawn=%d/%d",len(matches),drawn,len(matches))
+        pages.append(img)
+    plb.close(); pdc.close()
+    log.info("Saving → %s",out)
+    rgb=[i.convert("RGB") for i in pages]
+    rgb[0].save(str(out),save_all=True,append_images=rgb[1:],resolution=150)
+    log.info("DONE  det=%d drawn=%d pages=%d",td,tdr,len(pages))
+    if report: _rpt(summary,tdr,td)
     return summary
 
-
-def _print_report(summary, drawn, total):
-    print("\n"+"═"*72)
-    print("  PII MASKING REPORT v5 — Font-Matched · Precision Detection")
-    print("═"*72)
-    counts:Dict[str,int]={}
-    grand=0
-    for pg,matches in sorted(summary.items()):
-        if matches:
+def _rpt(s,d,t):
+    print("\n"+"═"*70)
+    print("  PII MASKING REPORT v6  ·  Spatial + OCR + Font Match")
+    print("═"*70)
+    c={}; g=0
+    for pg,ms in sorted(s.items()):
+        if ms:
             print(f"\n  Page {pg}:")
-            for m in matches:
+            for m in ms:
                 lo=len(m.original.strip()); lm=len(m.masked.strip())
-                ok="✓" if lo==lm else f"✗{lo}→{lm}"
-                print(f"    [{m.label:<16}] {m.original!r:<36} → {m.masked!r}  [{ok}]")
-                counts[m.label]=counts.get(m.label,0)+1; grand+=1
-    print("\n"+"─"*72)
-    print(f"  Total: {grand}   Drawn: {drawn}")
-    for lbl,cnt in sorted(counts.items(),key=lambda x:-x[1]):
-        print(f"    {lbl:<22} {cnt:>3}  {'█'*min(cnt,35)}")
-    print("═"*72+"\n")
-
+                print(f"    [{m.label:<16}] {m.original!r:<36} → {m.masked!r}  [{'✓' if lo==lm else f'✗{lo}>{lm}'}]")
+                c[m.label]=c.get(m.label,0)+1; g+=1
+    print("\n"+"─"*70); print(f"  Total: {g}   Drawn: {d}")
+    for l,n in sorted(c.items(),key=lambda x:-x[1]):
+        print(f"    {l:<22} {n:>3}  {'█'*min(n,35)}")
+    print("═"*70)
 
 def main():
-    ap=argparse.ArgumentParser(description="PDF PII Masker v5")
+    ap=argparse.ArgumentParser()
     ap.add_argument("input"); ap.add_argument("output")
     ap.add_argument("--scale",type=float,default=2.0)
     ap.add_argument("--seed",type=int,default=42)
@@ -770,8 +500,7 @@ def main():
     ap.add_argument("--debug",action="store_true")
     args=ap.parse_args()
     if args.debug: logging.getLogger().setLevel(logging.DEBUG)
-    if not Path(args.input).exists():
-        log.error("Not found: %s",args.input); sys.exit(1)
+    if not Path(args.input).exists(): log.error("Not found: %s",args.input); sys.exit(1)
     process_pdf(args.input,args.output,args.scale,args.seed,not args.no_report)
 
 if __name__=="__main__":
