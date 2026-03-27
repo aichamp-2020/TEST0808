@@ -1,39 +1,43 @@
 """
-PDF PII Masker v6 — Windows / macOS / Linux Compatible
-=======================================================
-Masks PII in PDF files: Name · ORG · Address · Phone · Email · SSN
-                        Account IDs · DOB · EIN · NPI · Routing · ZIP
+PDF PII Masker v7 — Hybrid Text + Image Masking (Windows/Mac/Linux)
+====================================================================
+Three-mode pipeline handles every PDF type:
 
-INSTALL (run once in Command Prompt / Terminal):
-    pip install pdfplumber pypdfium2 Pillow pytesseract pypdf
+  MODE 1 — PURE TEXT PAGE  (chars >= 20, no embedded images)
+    Detection : pdfplumber.extract_text()
+    Positioning: Spatial char-stream word groups → exact pixel coords
+    Rendering  : LiberationSans/Arial at matched PDF pt size + color
 
-Tesseract OCR (only needed for scanned/image PDFs):
-    Windows : https://github.com/UB-Mannheim/tesseract/wiki
-              Default install path: C:\\Program Files\\Tesseract-OCR
-    macOS   : brew install tesseract
-    Linux   : sudo apt install tesseract-ocr
+  MODE 2 — HYBRID PAGE  (chars >= 20 AND embedded images present)
+    → Runs MODE 1 on the selectable text layer
+    → ALSO runs OCR on every embedded image region
+    → Masks both text layer and image regions independently
+
+  MODE 3 — PURE IMAGE PAGE  (chars < 20)
+    Detection : pytesseract OCR on full page render
+    Rendering  : Same OCR bbox masking
+
+PII TARGETS: Name · ORG · Address · Phone · Email · SSN
+             Account IDs · DOB · EIN · NPI · Routing · ZIP
+
+INSTALL:
+  pip install pdfplumber pypdfium2 Pillow pytesseract pypdf
+
+Tesseract (for image/hybrid pages):
+  Windows : https://github.com/UB-Mannheim/tesseract/wiki
+  macOS   : brew install tesseract
+  Linux   : sudo apt install tesseract-ocr
 
 USAGE:
-    python pdf_pii_masker_v6.py input.pdf output.pdf
-    python pdf_pii_masker_v6.py input.pdf output.pdf --scale 3.0
-    python pdf_pii_masker_v6.py input.pdf output.pdf --seed 99
-    python pdf_pii_masker_v6.py input.pdf output.pdf --debug
+  python pdf_pii_masker_v7.py input.pdf output.pdf
+  python pdf_pii_masker_v7.py input.pdf output.pdf --scale 3.0
+  python pdf_pii_masker_v7.py input.pdf output.pdf --debug
 """
 
-import re
-import sys
-import os
-import shutil
-import random
-import logging
-import argparse
-import dataclasses
-import hashlib
-import platform
+import re, sys, os, shutil, random, logging, argparse, dataclasses, hashlib, platform
 from pathlib import Path
 from typing import List, Dict, Tuple, Any
 
-# ─── Dependency check ────────────────────────────────────────────────
 _MISSING = []
 try:    import pdfplumber
 except: _MISSING.append("pdfplumber")
@@ -42,140 +46,115 @@ except: _MISSING.append("pypdfium2")
 try:    from PIL import Image, ImageDraw, ImageFont
 except: _MISSING.append("Pillow")
 if _MISSING:
-    print(f"\nERROR — Missing packages: {', '.join(_MISSING)}")
+    print(f"\nERROR — Missing: {', '.join(_MISSING)}")
     print(f"  Run:  pip install {' '.join(_MISSING)}\n")
     sys.exit(1)
 
 _HAVE_TESS = False
-try:
-    import pytesseract
-    _HAVE_TESS = True
-except:
-    pass
+try:    import pytesseract; _HAVE_TESS = True
+except: pass
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("pii_v6")
+log = logging.getLogger("pii_v7")
 
-# ─── Cross-platform Tesseract setup ──────────────────────────────────
-def _setup_tesseract() -> bool:
-    if not _HAVE_TESS:
-        return False
-    win  = os.environ.get("WINDIR","C:\\Windows")
+# ─── Tesseract setup ──────────────────────────────────────────────────
+def _setup_tess() -> bool:
+    if not _HAVE_TESS: return False
     candidates = [
         os.path.join(os.environ.get("PROGRAMFILES","C:\\Program Files"),"Tesseract-OCR","tesseract.exe"),
-        os.path.join(os.environ.get("PROGRAMFILES(X86)","C:\\Program Files (x86)"),"Tesseract-OCR","tesseract.exe"),
+        os.path.join(os.environ.get("PROGRAMFILES(X86)",""),"Tesseract-OCR","tesseract.exe"),
         os.path.expanduser("~\\AppData\\Local\\Tesseract-OCR\\tesseract.exe"),
         "/usr/local/bin/tesseract", "/opt/homebrew/bin/tesseract", "/usr/bin/tesseract",
     ]
     for p in candidates:
         if os.path.isfile(p):
             pytesseract.pytesseract.tesseract_cmd = p
-            log.info("Tesseract: %s", p)
-            return True
+            log.info("Tesseract: %s", p); return True
     t = shutil.which("tesseract")
     if t:
         pytesseract.pytesseract.tesseract_cmd = t
-        log.info("Tesseract (PATH): %s", t)
-        return True
-    log.warning("Tesseract not found — image PDF pages will not be OCR-masked.\n"
+        log.info("Tesseract (PATH): %s", t); return True
+    log.warning("Tesseract not found — image PII on embedded images will not be masked.\n"
         "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
-        "  macOS:   brew install tesseract\n"
-        "  Linux:   sudo apt install tesseract-ocr")
+        "  macOS:   brew install tesseract\n  Linux:   sudo apt install tesseract-ocr")
     return False
 
-_TESS_OK = _setup_tesseract()
+_TESS_OK = _setup_tess()
 
-# ─── Cross-platform font discovery ───────────────────────────────────
-def _find_font(bold: bool = False) -> str:
-    win_fonts = os.path.join(os.environ.get("WINDIR","C:\\Windows"), "Fonts")
-    windows = [
-        os.path.join(win_fonts, "arialbd.ttf" if bold else "arial.ttf"),
-        os.path.join(win_fonts, "calibrib.ttf" if bold else "calibri.ttf"),
-        os.path.join(win_fonts, "tahomabd.ttf" if bold else "tahoma.ttf"),
-        os.path.join(win_fonts, "verdanab.ttf" if bold else "verdana.ttf"),
-    ]
-    mac = [
-        "/System/Library/Fonts/Helvetica.ttc",
-        ("/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf"),
-        ("/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold
-         else "/System/Library/Fonts/Supplemental/Arial.ttf"),
-    ]
-    linux = [
-        ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold
-         else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
-         else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        ("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold
-         else "/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
-    ]
-    sys_ = platform.system()
-    order = (windows + linux + mac if sys_ == "Windows"
-             else mac + linux + windows if sys_ == "Darwin"
-             else linux + mac + windows)
-    for p in order:
-        if os.path.isfile(p):
-            return p
+# ─── Font ──────────────────────────────────────────────────────────────
+def _find_font(bold=False):
+    wf = os.path.join(os.environ.get("WINDIR","C:\\Windows"), "Fonts")
+    cands = (
+        [os.path.join(wf,"arialbd.ttf" if bold else "arial.ttf"),
+         os.path.join(wf,"calibrib.ttf" if bold else "calibri.ttf")]
+        if platform.system()=="Windows" else
+        ["/System/Library/Fonts/Helvetica.ttc",
+         "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf"]
+        if platform.system()=="Darwin" else
+        ["/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold
+         else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+         else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    )
+    for p in cands:
+        if os.path.isfile(p): return p
     return None
 
-_FC: Dict[Tuple, Any] = {}
-def _font(px: int, bold: bool = False):
-    k = (px, bold)
+_FC = {}
+def _font(px, bold=False):
+    k=(px,bold)
     if k not in _FC:
-        p = _find_font(bold)
-        px = max(6, px)
-        try:   _FC[k] = ImageFont.truetype(p, px) if p else ImageFont.load_default()
-        except: _FC[k] = ImageFont.load_default()
+        p=_find_font(bold); px=max(6,px)
+        try:   _FC[k]=ImageFont.truetype(p,px) if p else ImageFont.load_default()
+        except: _FC[k]=ImageFont.load_default()
     return _FC[k]
 
-# ─── Spatial word (from PDF char stream) ─────────────────────────────
+# ─── Spatial word (char-stream) ────────────────────────────────────────
 @dataclasses.dataclass
-class SWord:
+class SW:
     text:str; x0:float; top:float; x1:float; bottom:float
     size:float; bold:bool; color:Tuple
 
-def _spatial_words(page) -> List[SWord]:
-    raw = page.chars
+def _sw(page) -> List[SW]:
+    raw=page.chars
     if not raw: return []
-    groups, cur = [], []
+    grps,cur=[],[]
     for c in raw:
         if not c["text"] or not c["text"].strip():
-            if cur: groups.append(cur); cur = []
-            continue
+            if cur: grps.append(cur); cur=[]; continue
         if not cur: cur.append(c); continue
-        if abs(c["top"]-cur[-1]["top"]) < 3 and c["x0"]-cur[-1]["x1"] < 3:
-            cur.append(c)
+        if abs(c["top"]-cur[-1]["top"])<3 and c["x0"]-cur[-1]["x1"]<3: cur.append(c)
         else:
-            if cur: groups.append(cur)
-            cur = [c]
-    if cur: groups.append(cur)
-    result = []
-    for g in groups:
-        fn = g[0].get("fontname",""); bold = "Bold" in fn or "bold" in fn
-        col = g[0].get("non_stroking_color",(0.,0.,0.))
+            if cur: grps.append(cur)
+            cur=[c]
+    if cur: grps.append(cur)
+    res=[]
+    for g in grps:
+        fn=g[0].get("fontname",""); bold="Bold" in fn or "bold" in fn
+        col=g[0].get("non_stroking_color",(0.,0.,0.))
         if not isinstance(col,(list,tuple)): col=(0.,0.,0.)
-        col = tuple(float(v) for v in list(col)[:3])
-        if len(col)<3: col = col+(0.,)*(3-len(col))
-        result.append(SWord(
-            text="".join(c["text"] for c in g),
-            x0=min(c["x0"] for c in g), top=min(c["top"] for c in g),
-            x1=max(c["x1"] for c in g), bottom=max(c["bottom"] for c in g),
-            size=float(g[0].get("size",9.0)), bold=bold, color=col))
-    return result
+        col=tuple(float(v) for v in list(col)[:3])
+        if len(col)<3: col=col+(0.,)*(3-len(col))
+        res.append(SW(text="".join(c["text"] for c in g),
+            x0=min(c["x0"] for c in g),top=min(c["top"] for c in g),
+            x1=max(c["x1"] for c in g),bottom=max(c["bottom"] for c in g),
+            size=float(g[0].get("size",9.0)),bold=bold,color=col))
+    return res
 
-def _n(s): return re.sub(r"[\s\-./,()+@]","",s).lower()
+def _norm(s): return re.sub(r"[\s\-./,()+@]","",s).lower()
 
-def _find_boxes(value: str, words: List[SWord]) -> List[SWord]:
+def _find_boxes(value, words):
     if not value.strip(): return []
-    vn = _n(value)
+    vn=_norm(value)
     if not vn: return []
     for w in words:
-        if w.text==value.strip() or _n(w.text)==vn: return [w]
-    for win in range(1, min(9,len(words)+1)):
+        if w.text==value.strip() or _norm(w.text)==vn: return [w]
+    for win in range(1,min(9,len(words)+1)):
         for i in range(len(words)-win+1):
-            grp = words[i:i+win]
-            if max(w.top for w in grp)-min(w.top for w in grp) > 22: continue
-            combined=" ".join(w.text for w in grp); cn=_n(combined)
+            grp=words[i:i+win]
+            if max(w.top for w in grp)-min(w.top for w in grp)>22: continue
+            combined=" ".join(w.text for w in grp); cn=_norm(combined)
             if not cn or len(cn)<2: continue
             if vn in cn or (cn in vn and len(cn)>=max(4,len(vn)//2)) or value.strip() in combined:
                 return grp
@@ -183,9 +162,9 @@ def _find_boxes(value: str, words: List[SWord]) -> List[SWord]:
     if len(vtoks)>=2:
         found=[]; pool={i:w for i,w in enumerate(words)}
         for vt in vtoks:
-            vtn=_n(vt)
+            vtn=_norm(vt)
             for i,w in list(pool.items()):
-                if _n(w.text)==vtn or vtn in _n(w.text): found.append(w); del pool[i]; break
+                if _norm(w.text)==vtn or vtn in _norm(w.text): found.append(w); del pool[i]; break
         if len(found)>=max(1,len(vtoks)//2):
             tops=[b.top for b in found]
             if not found or max(tops)-min(tops)<30: return found
@@ -195,10 +174,10 @@ def _find_boxes(value: str, words: List[SWord]) -> List[SWord]:
         if len(wc)>=4 and (vc in wc or (wc in vc and len(wc)>=max(4,len(vc)//3))): return [w]
     return []
 
-# ─── Redact & draw ────────────────────────────────────────────────────
+# ─── Redact text layer ────────────────────────────────────────────────
 def _c255(c): return tuple(min(255,max(0,int(v*255))) for v in c[:3])
 
-def redact(img, boxes, masked, scale):
+def redact_text(img, boxes, masked, scale):
     if not boxes: return img
     draw=ImageDraw.Draw(img); PAD=1
     x0=min(b.x0 for b in boxes); y0=min(b.top for b in boxes)
@@ -220,20 +199,45 @@ def redact(img, boxes, masked, scale):
     draw.text((px0+1,py0+max(0,(bh-th)//2)),masked.strip(),fill=tc,font=f)
     return img
 
+# ─── Redact image region (OCR bbox) ──────────────────────────────────
+def redact_ocr_box(img, x0, y0, x1, y1, masked, bg_sample_color=None):
+    """White-out OCR bbox and draw masked text at matched size."""
+    draw=ImageDraw.Draw(img)
+    bw=x1-x0; bh=y1-y0
+    bg = bg_sample_color or (255,255,255)
+    draw.rectangle([x0-1,y0-1,x1+1,y1+1],fill=bg)
+    if not masked.strip(): return img
+    sz=max(6,int(bh*0.72))
+    for a in range(sz,5,-1):
+        f=_font(a,False)
+        try: tw=draw.textbbox((0,0),masked,font=f)[2]
+        except: tw=len(masked)*a*0.55
+        if tw<=bw+4: sz=a; break
+    f=_font(sz,False)
+    try: th=draw.textbbox((0,0),masked,font=f)[3]
+    except: th=sz
+    ty=y0+max(0,(bh-th)//2)
+    # Use dark text on light background
+    text_color=(15,15,15) if sum(bg)>380 else (240,240,240)
+    draw.text((x0+2,ty),masked,fill=text_color,font=f)
+    return img
+
 # ─── Fake-data engine ─────────────────────────────────────────────────
 _FN=["James","Robert","Michael","William","David","Richard","Joseph","Thomas",
      "Mary","Patricia","Jennifer","Linda","Barbara","Elizabeth","Susan",
      "Jessica","Sarah","Karen","Lisa","Nancy","Emily","Ashley","Liam","Noah",
-     "Sophia","Emma","Olivia","Ava","Isabella","Charlotte"]
+     "Sophia","Emma","Olivia","Ava","Isabella","Charlotte","Harper","Amelia"]
 _LN=["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis",
      "Rodriguez","Martinez","Lopez","Wilson","Anderson","Taylor","Moore",
      "Jackson","Martin","Lee","Perez","Thompson","White","Harris","Clark",
-     "Ramirez","Lewis","Robinson","Walker","Young","King","Wright","Scott"]
+     "Ramirez","Lewis","Robinson","Walker","Young","King","Wright","Scott",
+     "Torres","Nguyen","Hill","Flores","Green","Adams","Nelson","Baker"]
 _SN=["Oak","Maple","Cedar","Pine","Elm","Washington","Lincoln","Highland",
-     "Riverside","Meadow","Valley","Ridge","Lake","Spring","Prairie"]
-_ST=["Street","Avenue","Boulevard","Road","Lane","Drive","Court","Place","Way"]
+     "Riverside","Meadow","Valley","Ridge","Lake","Spring","Prairie","Willow"]
+_ST=["Street","Avenue","Boulevard","Road","Lane","Drive","Court","Place","Way","Circle"]
 _CT=["Springfield","Franklin","Clinton","Salem","Fairview","Madison","Arlington",
-     "Burlington","Greenville","Newport","Bristol","Lakewood","Clayton","Winchester"]
+     "Burlington","Greenville","Newport","Bristol","Lakewood","Clayton","Winchester",
+     "Millbrook","Riverside","Westfield","Maplewood"]
 _SA=["AL","AZ","CA","CO","CT","FL","GA","IL","IN","KY","LA","MD","MA","MI",
      "MN","MO","NJ","NY","NC","OH","OR","PA","TN","TX","VA","WA","WI"]
 _ED=["gmail","yahoo","outlook","icloud","hotmail","protonmail","fastmail"]
@@ -244,7 +248,7 @@ _OT=["Analytics","Solutions","Services","Group","Systems","Consulting",
      "Dental","Vision","Pharmacy","Rehab","Clinic","Center","Hospital"]
 
 class Faker:
-    def __init__(self,seed=42): self._s=seed; self._c={}
+    def __init__(self,s=42): self._s=s; self._c={}
     def _r(self,k): return random.Random(int(hashlib.md5((str(self._s)+k).encode()).hexdigest(),16)&0xFFFFFFFF)
     def _f(self,w,n):
         w=w.strip() or "X"
@@ -419,13 +423,14 @@ _NSTOP={"invoice","header","number","date","period","billing","employer","group"
     "balance","information","section","general","certificate","identification",
     "january","february","march","april","june","july","august","september","october",
     "november","december","monday","tuesday","wednesday","thursday","friday","saturday",
-    "sunday","no","id","po","st","rd","ave","blvd","ct","ln","pl","synthetic","fictional"}
+    "sunday","no","id","po","st","rd","ave","blvd","ct","ln","pl","synthetic","fictional",
+    "confidential","contains","protected","health","registration","form","authorized",
+    "signature","date"}
+
 _NRE=re.compile(r"(?:(?:Dr|Mr|Mrs|Ms|Prof)\.?\s+)?(?<![A-Za-z])([A-Z][a-z]{1,20})\s+"
     r"([A-Z][a-z]{1,20})(?:\s+([A-Z][a-z]{1,20}))?(?![A-Za-z])")
-
 _ADDR_S={"st","street","ave","avenue","blvd","boulevard","rd","road","ln","lane",
-    "dr","drive","ct","court","pl","place","way","cir","circle","hwy","highway",
-    "pkwy","parkway","ter","terrace"}
+    "dr","drive","ct","court","pl","place","way","cir","circle","hwy","highway","pkwy","ter","terrace"}
 _USS={"AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS",
     "KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY",
     "NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","DC"}
@@ -434,7 +439,7 @@ _STRE=re.compile(r"\b\d{2,5}\s+(?:[A-Za-z]+\s+){0,4}(?:"+"|".join(_ADDR_S)+r")(?
 _CSTE=re.compile(r"\b([A-Z][a-z]{2,20}(?:\s+[A-Z][a-z]{2,20})?),\s*("+"|".join(_USS)+r")(?:\s+(\d{5}(?:-\d{4})?))?")
 _PBXE=re.compile(r"\bP\.?\s*O\.?\s*Box\s+\d{3,6}\b",re.I)
 
-def _lbnames(text):
+def _lbn(text):
     res=[]
     for m in _LBPAT.finditer(text):
         rest=text[m.end():m.end()+60]; vm=_LBVAL.match(rest)
@@ -444,7 +449,7 @@ def _lbnames(text):
                 res.append((m.end(),m.end()+len(v),v))
     return res
 
-def _persons(text):
+def _pers(text):
     res=[]
     for m in _NRE.finditer(text):
         parts=[g for g in [m.group(1),m.group(2),m.group(3)] if g]
@@ -468,7 +473,7 @@ class PIIMatch:
 
 def _ov(s,e,occ): return any(s<oe and e>os for os,oe in occ)
 
-def detect_pii(text:str, faker:Faker) -> List[PIIMatch]:
+def detect_pii(text, faker):
     occ=[]; acc=[]
     def add(s,e,o,l):
         orig=o.strip()
@@ -479,82 +484,215 @@ def detect_pii(text:str, faker:Faker) -> List[PIIMatch]:
         for m in sorted(rx.finditer(text),key=lambda x:(x.start(),-(x.end()-x.start()))): add(m.start(),m.end(),m.group(),l)
     for s,e,v in sorted(_orgs(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"ORG")
     for s,e,v in sorted(_addrs(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"ADDRESS")
-    for s,e,v in sorted(_lbnames(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"NAME")
-    for s,e,v in sorted(_persons(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"NAME")
+    for s,e,v in sorted(_lbn(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"NAME")
+    for s,e,v in sorted(_pers(text),key=lambda x:(x[0],-(x[1]-x[0]))): add(s,e,v,"NAME")
     acc.sort(key=lambda x:x[0])
     return [PIIMatch(l,o,faker.mask(o,l),s,e) for s,e,o,l in acc]
 
-# ─── OCR pipeline ─────────────────────────────────────────────────────
-def _ocr(img, faker):
-    if not _TESS_OK: log.warning("Tesseract unavailable — image page skipped"); return img
+# ─── OCR masker — for image regions ──────────────────────────────────
+def _ocr_region(img, faker, ox=0, oy=0, label=""):
+    """
+    Run OCR on img (or a sub-region), detect PII, draw replacements.
+    ox/oy are pixel offsets for sub-region crops (for embedded images on text pages).
+    label is just for logging.
+    """
+    if not _TESS_OK:
+        log.warning("Tesseract unavailable — %s skipped", label or "image region")
+        return img
+
     import pytesseract
-    draw=ImageDraw.Draw(img)
-    data=pytesseract.image_to_data(img,output_type=pytesseract.Output.DICT,lang="eng",config="--psm 6")
-    n=len(data["text"])
-    words=[(data["text"][i],data["left"][i],data["top"][i],data["width"][i],data["height"][i])
-           for i in range(n) if data["text"][i].strip() and int(data["conf"][i])>30]
-    if not words: return img
-    full=" ".join(w[0] for w in words); matches=detect_pii(full,faker)
-    cursor=0; wpos=[]
+    draw = ImageDraw.Draw(img)
+
+    # Get word-level OCR data
+    data = pytesseract.image_to_data(
+        img if (ox==0 and oy==0) else img.crop((ox,oy,img.width,img.height)),
+        output_type=pytesseract.Output.DICT, lang="eng", config="--psm 6"
+    )
+    n = len(data["text"])
+    words = [
+        (data["text"][i],
+         data["left"][i] + ox, data["top"][i] + oy,
+         data["width"][i], data["height"][i])
+        for i in range(n)
+        if data["text"][i].strip() and int(data["conf"][i]) > 25
+    ]
+    if not words:
+        return img
+
+    full = " ".join(w[0] for w in words)
+    matches = detect_pii(full, faker)
+
+    if not matches:
+        return img
+
+    log.info("    OCR region '%s': %d words, %d PII found", label, len(words), len(matches))
+
+    # Build word char-offset map
+    cursor = 0; wpos = []
     for txt,l,t,w,h in words:
-        idx=full.find(txt,cursor)
-        if idx>=0: wpos.append((idx,idx+len(txt),l,t,w,h)); cursor=idx+len(txt)
+        idx = full.find(txt, cursor)
+        if idx >= 0:
+            wpos.append((idx, idx+len(txt), l, t, w, h))
+            cursor = idx + len(txt)
+
     for m in matches:
-        hits=[wp for wp in wpos if wp[0]<m.end and wp[1]>m.start]
-        if not hits: continue
-        x0=min(wp[2] for wp in hits); y0=min(wp[3] for wp in hits)
-        x1=max(wp[2]+wp[4] for wp in hits); y1=max(wp[3]+wp[5] for wp in hits)
-        bw=x1-x0; bh=y1-y0
-        draw.rectangle([x0-1,y0-1,x1+1,y1+1],fill=(255,255,255))
-        sz=max(6,int(bh*0.72))
-        for a in range(sz,5,-1):
-            f=_font(a,False)
-            try: tw=draw.textbbox((0,0),m.masked,font=f)[2]
-            except: tw=len(m.masked)*a*0.55
-            if tw<=bw+4: sz=a; break
-        draw.text((x0+1,y0+1),m.masked,fill=(0,0,0),font=_font(sz))
-        log.debug("  OCR [%s] %r->%r",m.label,m.original,m.masked)
+        hits = [wp for wp in wpos if wp[0]<m.end and wp[1]>m.start]
+        if not hits:
+            continue
+        x0 = min(wp[2] for wp in hits)
+        y0 = min(wp[3] for wp in hits)
+        x1 = max(wp[2]+wp[4] for wp in hits)
+        y1 = max(wp[3]+wp[5] for wp in hits)
+        bw = x1-x0; bh = y1-y0
+
+        # Sample background color at this location for better blending
+        try:
+            region = img.crop((x0, y0, x1, y1))
+            avg = region.resize((1,1)).getpixel((0,0))
+            bg = avg[:3] if isinstance(avg, tuple) else (255,255,255)
+        except:
+            bg = (255,255,255)
+
+        img = redact_ocr_box(img, x0, y0, x1, y1, m.masked, bg)
+        log.debug("    OCR [%s] %r -> %r", m.label, m.original, m.masked)
+
     return img
 
-# ─── Main pipeline ─────────────────────────────────────────────────────
-def process_pdf(inp,out,scale=2.0,seed=42,report=True):
+# ─── Main pipeline ────────────────────────────────────────────────────
+def process_pdf(inp, out, scale=2.0, seed=42, report=True):
     inp=Path(inp); out=Path(out); faker=Faker(seed)
-    log.info("Opening: %s  scale=%.1f",inp,scale)
-    plb=pdfplumber.open(str(inp)); pdc=pdfium.PdfDocument(str(inp))
+    log.info("Opening: %s  scale=%.1f", inp, scale)
+
+    plb = pdfplumber.open(str(inp))
+    pdc = pdfium.PdfDocument(str(inp))
     pages=[]; summary={}; td=tdr=0
-    for idx,pl in enumerate(plb.pages):
-        log.info("  Page %d/%d",idx+1,len(plb.pages))
-        img=pdc[idx].render(scale=scale,rotation=0).to_pil().convert("RGB")
-        if len(pl.chars)<20:
-            log.info("    Image-based -> OCR"); img=_ocr(img,faker); pages.append(img); continue
-        raw=pl.extract_text(layout=False) or ""
-        text=re.sub(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+)\.\n([A-Za-z]{2,})",
-                    lambda m:m.group(1)+"."+m.group(2),raw)
-        matches=detect_pii(text,faker); summary[idx+1]=matches; td+=len(matches)
-        if not matches: pages.append(img); continue
-        sw=_spatial_words(pl); drawn=0
+
+    for idx, pl in enumerate(plb.pages):
+        log.info("  Page %d/%d", idx+1, len(plb.pages))
+        img = pdc[idx].render(scale=scale, rotation=0).to_pil().convert("RGB")
+
+        n_chars  = len(pl.chars)
+        n_images = len(pl.images)
+
+        # ── MODE 3: Pure image page ────────────────────────────────────
+        if n_chars < 20:
+            log.info("    MODE 3 — pure image page: full-page OCR")
+            img = _ocr_region(img, faker, label=f"page{idx+1}_full")
+            pages.append(img); continue
+
+        # ── Text extraction ────────────────────────────────────────────
+        raw  = pl.extract_text(layout=False) or ""
+        text = re.sub(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+)\.\n([A-Za-z]{2,})",
+                      lambda m: m.group(1)+"."+m.group(2), raw)
+        matches = detect_pii(text, faker)
+        summary[idx+1] = matches; td += len(matches)
+
+        # ── MODE 1/2 text-layer masking ────────────────────────────────
+        mode = "MODE 2 (hybrid)" if n_images > 0 else "MODE 1 (text)"
+        log.info("    %s: text_pii=%d  embedded_images=%d", mode, len(matches), n_images)
+
+        sw = _sw(pl)
+        drawn = 0
         for m in matches:
-            boxes=_find_boxes(m.original,sw)
+            boxes = _find_boxes(m.original, sw)
             if not boxes:
-                for run in re.findall(r"[A-Za-z0-9]{4,}",m.original):
+                for run in re.findall(r"[A-Za-z0-9]{4,}", m.original):
                     for w in sw:
                         if run.lower() in w.text.lower() and len(w.text)>=3: boxes=[w]; break
                     if boxes: break
-            if boxes: img=redact(img,boxes,m.masked,scale); drawn+=1
-            else: log.warning("  NO BOX [%s]: %r",m.label,m.original)
-        tdr+=drawn; log.info("    detected=%d drawn=%d/%d",len(matches),drawn,len(matches))
+            if boxes:
+                img = redact_text(img, boxes, m.masked, scale); drawn+=1
+                log.debug("    TEXT [%s] %r->%r", m.label, m.original, m.masked)
+            else:
+                log.warning("    NO BOX [%s]: %r", m.label, m.original)
+        tdr += drawn
+
+        # ── MODE 2: Also OCR every embedded image region ───────────────
+        if n_images > 0 and _TESS_OK:
+            ph = pl.height  # PDF coordinate height
+            for img_idx, img_info in enumerate(pl.images):
+                # PDF coords (origin bottom-left) → PIL pixels (origin top-left)
+                # pdfplumber already gives us top/bottom in top-left coords
+                x0_pdf = img_info.get("x0", 0)
+                y0_pdf = img_info.get("top", 0)
+                x1_pdf = img_info.get("x1", pl.width)
+                y1_pdf = img_info.get("bottom", ph)
+
+                px0 = max(0, int(x0_pdf * scale) - 5)
+                py0 = max(0, int(y0_pdf * scale) - 5)
+                px1 = min(img.width,  int(x1_pdf * scale) + 5)
+                py1 = min(img.height, int(y1_pdf * scale) + 5)
+
+                log.info("    OCR embedded image[%d]: bbox=(%d,%d,%d,%d) px",
+                         img_idx, px0, py0, px1, py1)
+
+                # Crop the image region, run OCR, draw masks back on full img
+                region_img = img.crop((px0, py0, px1, py1)).convert("RGB")
+
+                # Run OCR on the cropped region
+                import pytesseract
+                data = pytesseract.image_to_data(
+                    region_img, output_type=pytesseract.Output.DICT,
+                    lang="eng", config="--psm 6"
+                )
+                n = len(data["text"])
+                words = [
+                    (data["text"][i],
+                     data["left"][i] + px0, data["top"][i] + py0,
+                     data["width"][i], data["height"][i])
+                    for i in range(n)
+                    if data["text"][i].strip() and int(data["conf"][i]) > 25
+                ]
+
+                if not words:
+                    log.info("    OCR: no words found in image region")
+                    continue
+
+                full_ocr = " ".join(w[0] for w in words)
+                ocr_matches = detect_pii(full_ocr, faker)
+                log.info("    OCR: %d words detected, %d PII items", len(words), len(ocr_matches))
+
+                # Build word positions (relative to full page image)
+                cursor=0; wpos=[]
+                for txt,l,t,w,h in words:
+                    fidx = full_ocr.find(txt, cursor)
+                    if fidx >= 0:
+                        wpos.append((fidx, fidx+len(txt), l, t, w, h))
+                        cursor = fidx + len(txt)
+
+                draw = ImageDraw.Draw(img)
+                for m in ocr_matches:
+                    hits=[wp for wp in wpos if wp[0]<m.end and wp[1]>m.start]
+                    if not hits: continue
+                    bx0=min(wp[2] for wp in hits); by0=min(wp[3] for wp in hits)
+                    bx1=max(wp[2]+wp[4] for wp in hits); by1=max(wp[3]+wp[5] for wp in hits)
+                    bw=bx1-bx0; bh=by1-by0
+
+                    # Sample background for blending
+                    try:
+                        reg=img.crop((bx0,by0,bx1,by1))
+                        avg=reg.resize((1,1)).getpixel((0,0))
+                        bg=avg[:3] if isinstance(avg,tuple) else (255,255,255)
+                    except: bg=(255,255,255)
+
+                    img = redact_ocr_box(img,bx0,by0,bx1,by1,m.masked,bg)
+                    tdr += 1; drawn += 1
+                    log.info("    IMG-OCR [%s] %r -> %r", m.label, m.original, m.masked)
+
+        log.info("    drawn=%d/%d", drawn, len(matches))
         pages.append(img)
+
     plb.close(); pdc.close()
-    log.info("Saving -> %s",out)
+    log.info("Saving -> %s", out)
     rgb=[i.convert("RGB") for i in pages]
-    rgb[0].save(str(out),save_all=True,append_images=rgb[1:],resolution=150)
-    log.info("DONE  det=%d drawn=%d pages=%d",td,tdr,len(pages))
-    if report: _rpt(summary,tdr,td)
+    rgb[0].save(str(out), save_all=True, append_images=rgb[1:], resolution=150)
+    log.info("DONE  det=%d drawn=%d pages=%d", td, tdr, len(pages))
+    if report: _rpt(summary, tdr, td)
     return summary
 
 def _rpt(s,d,t):
     print("\n"+"="*70)
-    print("  PII MASKING REPORT v6  |  Spatial + OCR + Font Match")
+    print("  PII MASKING REPORT v7  |  Text + Embedded Image OCR + Font Match")
     print("="*70)
     c={}; g=0
     for pg,ms in sorted(s.items()):
@@ -570,33 +708,30 @@ def _rpt(s,d,t):
     print("="*70)
 
 def main():
-    ap=argparse.ArgumentParser(
-        description="PDF PII Masker v6 -- Windows/Mac/Linux",
+    ap=argparse.ArgumentParser(description="PDF PII Masker v7 -- Hybrid Text+Image OCR",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python pdf_pii_masker_v6.py invoice.pdf masked.pdf
-  python pdf_pii_masker_v6.py invoice.pdf masked.pdf --scale 3.0
-  python pdf_pii_masker_v6.py invoice.pdf masked.pdf --seed 99 --debug
+MODES:
+  Text pages        : Spatial char-stream masking (font/color matched)
+  Hybrid pages      : Text-layer masking + OCR on every embedded image
+  Pure image pages  : Full-page OCR masking
 
-Install:
+INSTALL:
   pip install pdfplumber pypdfium2 Pillow pytesseract pypdf
 
-Tesseract OCR (for scanned/image PDFs):
-  Windows:  https://github.com/UB-Mannheim/tesseract/wiki
-  macOS:    brew install tesseract
-  Linux:    sudo apt install tesseract-ocr
+Tesseract OCR:
+  Windows: https://github.com/UB-Mannheim/tesseract/wiki
+  macOS:   brew install tesseract
+  Linux:   sudo apt install tesseract-ocr
         """)
-    ap.add_argument("input",  help="Input PDF path")
-    ap.add_argument("output", help="Output (masked) PDF path")
-    ap.add_argument("--scale",     type=float,default=2.0, help="Render quality (default 2.0, use 3.0 for higher quality)")
-    ap.add_argument("--seed",      type=int,  default=42,  help="Random seed for reproducibility (default 42)")
-    ap.add_argument("--no-report", action="store_true",    help="Suppress printed masking summary")
-    ap.add_argument("--debug",     action="store_true",    help="Enable verbose debug logging")
+    ap.add_argument("input"); ap.add_argument("output")
+    ap.add_argument("--scale",type=float,default=2.0,help="Render quality (default 2.0)")
+    ap.add_argument("--seed",type=int,default=42,help="Random seed (default 42)")
+    ap.add_argument("--no-report",action="store_true")
+    ap.add_argument("--debug",action="store_true")
     args=ap.parse_args()
     if args.debug: logging.getLogger().setLevel(logging.DEBUG)
-    if not Path(args.input).exists():
-        print(f"\nERROR: File not found: {args.input}\n"); sys.exit(1)
+    if not Path(args.input).exists(): print(f"\nERROR: {args.input} not found\n"); sys.exit(1)
     process_pdf(args.input,args.output,args.scale,args.seed,not args.no_report)
 
 if __name__=="__main__":
