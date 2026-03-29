@@ -1,1 +1,1299 @@
+"""
+AI Gateway API  v2  —  with full quota & rate-limit enforcement
+===============================================================
 
+Quota levels (checked in order, most-specific wins):
+  1. Global rate limit       — all requests across the gateway
+  2. Subscription tier       — per consumer key (standard / premium / internal)
+  3. Endpoint + environment  — per named endpoint group (abc / internal-smoldm2)
+  4. Model                   — per specific deployment (gpt-4o / gpt-35-turbo)
+  5. Backend instance        — per individual Azure OpenAI resource (mirrors Azure TPM/RPM)
+
+Consumer request
+----------------
+{
+  "endpoint":        "abc",
+  "provider":        "OpenAI",
+  "deployment_name": "gpt-4o",
+  "api_version":     "2024-06-01",
+  "messages":        [...]
+}
+
+Run
+---
+  python app.py                         # port 8000, auto env detection
+  python app.py --port 9000 --env prod  # force prod environment
+  GATEWAY_ENV=uat python app.py
+
+APIM inbound policy (auth + env header only — no backend policy needed)
+-----------------------------------------------------------------------
+  <inbound>
+    <base />
+    <rate-limit calls="60" renewal-period="60" />          <!-- consumer quota -->
+    <quota calls="5000" renewal-period="86400" />          <!-- daily consumer quota -->
+    <set-header name="X-Environment" exists-action="override"><value>prod</value></set-header>
+    <set-header name="X-APIM-Validated" exists-action="override"><value>true</value></set-header>
+    <set-backend-service base-url="https://your-gateway-host" />
+  </inbound>
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import time
+import uuid
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+from threading import Lock, Thread
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from flask import Flask, jsonify, render_template_string, request
+
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)-8s] %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger("gateway")
+
+MAPPING_FILE = os.environ.get("GATEWAY_MAPPING", "endpoint_mapping.json")
+ADMIN_KEY    = os.environ.get("GATEWAY_ADMIN_KEY", "changeme")
+GATEWAY_ENV  = os.environ.get("GATEWAY_ENV", "")
+TRUST_APIM   = os.environ.get("GATEWAY_TRUST_APIM", "true").lower() == "true"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Mapping manager  (hot-reload on file change)
+# ─────────────────────────────────────────────────────────────────────────────
+class MappingManager:
+    def __init__(self, path: str):
+        self.path  = Path(path)
+        self._data: dict = {}
+        self._lock = Lock()
+        self._mtime: float = 0.0
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            log.warning("Mapping file not found: %s", self.path)
+            return
+        try:
+            mtime = self.path.stat().st_mtime
+            with self.path.open() as f:
+                data = json.load(f)
+            with self._lock:
+                self._data  = data
+                self._mtime = mtime
+            log.info("Mapping loaded: %s", self.path)
+        except Exception as exc:
+            log.error("Failed to load mapping: %s", exc)
+
+    def reload_if_changed(self) -> bool:
+        try:
+            if self.path.stat().st_mtime != self._mtime:
+                self.load()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def get(self) -> dict:
+        with self._lock:
+            import copy
+            return copy.deepcopy(self._data)
+
+    def save(self) -> None:
+        with self._lock:
+            with self.path.open("w") as f:
+                json.dump(self._data, f, indent=2)
+        self._mtime = self.path.stat().st_mtime
+
+    def upsert_endpoint(self, name: str, env: str, config: dict) -> None:
+        with self._lock:
+            self._data.setdefault("endpoints", {}).setdefault(name, {})[env] = config
+        self.save()
+
+
+mapping = MappingManager(MAPPING_FILE)
+
+def _watch():
+    while True:
+        time.sleep(10)
+        if mapping.reload_if_changed():
+            log.info("Mapping reloaded (file changed on disk)")
+
+Thread(target=_watch, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Multi-level quota / rate-limit engine
+#
+#  Uses a sliding-window counter for every (scope, key) pair.
+#  Scopes:
+#    "global"               → whole gateway
+#    "sub:{sub_key}"        → per subscription key
+#    "endpoint:{ep}:{env}"  → per endpoint+environment
+#    "model:{ep}:{env}:{m}" → per model
+#    "instance:{inst_id}"   → per backend instance
+#
+#  Also maintains a daily counter (resets at midnight UTC) for
+#  requests_per_day checks.
+# ─────────────────────────────────────────────────────────────────────────────
+class QuotaEngine:
+    def __init__(self):
+        # sliding window  (scope_key → deque of timestamps)
+        self._windows: dict[str, deque] = defaultdict(deque)
+        # daily counters  (scope_key → {date_str, count})
+        self._daily:   dict[str, dict]  = defaultdict(lambda: {"date": "", "count": 0})
+        self._lock = Lock()
+
+    # ── internal ──────────────────────────────────────────────────────────
+    def _rpm_check(self, scope: str, limit: int) -> tuple[bool, int]:
+        """Sliding 60-second window. Returns (allowed, retry_after_seconds)."""
+        now  = time.time()
+        cutoff = now - 60.0
+        with self._lock:
+            q = self._windows[scope]
+            while q and q[0] < cutoff:
+                q.popleft()
+            if len(q) >= limit:
+                retry = int(60 - (now - q[0])) + 1
+                return False, retry
+            q.append(now)
+        return True, 0
+
+    def _tpm_check(self, scope: str, limit: int, tokens: int) -> tuple[bool, int]:
+        """TPM: treat each token as a fractional request in the window."""
+        now = time.time()
+        cutoff = now - 60.0
+        with self._lock:
+            q = self._windows[scope + ":tpm"]
+            while q and q[0][0] < cutoff:
+                q.popleft()
+            used = sum(t for _, t in q)
+            if used + tokens > limit:
+                retry = int(60 - (now - q[0][0])) + 1 if q else 60
+                return False, retry
+            q.append((now, tokens))
+        return True, 0
+
+    def _daily_check(self, scope: str, limit: int) -> tuple[bool, int]:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            d = self._daily[scope]
+            if d["date"] != today:
+                d["date"] = today
+                d["count"] = 0
+            if d["count"] >= limit:
+                return False, 86400   # retry tomorrow
+            d["count"] += 1
+        return True, 0
+
+    # ── public ────────────────────────────────────────────────────────────
+    def check(self, scope: str, quotas: dict, tokens: int = 0) -> tuple[bool, str, int]:
+        """
+        Check ALL limits in the quotas dict for this scope.
+        Returns (allowed, limit_type_hit, retry_after_seconds).
+        """
+        rpm = quotas.get("requests_per_minute")
+        rpd = quotas.get("requests_per_day")
+        tpm = quotas.get("tokens_per_minute")
+
+        if rpm:
+            ok, retry = self._rpm_check(scope, rpm)
+            if not ok:
+                return False, "requests_per_minute", retry
+
+        if rpd:
+            ok, retry = self._daily_check(scope + ":daily", rpd)
+            if not ok:
+                return False, "requests_per_day", retry
+
+        if tpm and tokens > 0:
+            ok, retry = self._tpm_check(scope, tpm, tokens)
+            if not ok:
+                return False, "tokens_per_minute", retry
+
+        return True, "", 0
+
+    def instance_check(self, instance_id: str, inst_quota: dict,
+                       tokens: int = 0) -> tuple[bool, str, int]:
+        """Check instance-level RPM / TPM."""
+        rpm = inst_quota.get("rpm_limit")
+        tpm = inst_quota.get("tpm_limit")
+        scope = f"instance:{instance_id}"
+
+        if rpm:
+            ok, retry = self._rpm_check(scope, rpm)
+            if not ok:
+                return False, "instance_rpm", retry
+
+        if tpm and tokens > 0:
+            ok, retry = self._tpm_check(scope, tpm, tokens)
+            if not ok:
+                return False, "instance_tpm", retry
+
+        return True, "", 0
+
+    def stats(self, scope: str) -> dict:
+        """Return current window size for a scope (for admin UI)."""
+        now = time.time()
+        cutoff = now - 60.0
+        with self._lock:
+            q = self._windows.get(scope, deque())
+            recent = sum(1 for t in q if t > cutoff)
+            daily = self._daily.get(scope + ":daily", {}).get("count", 0)
+        return {"last_60s": recent, "today": daily}
+
+
+quota_engine = QuotaEngine()
+
+
+def _subscription_tier(sub_key: str, sub_quotas: dict) -> dict:
+    """Match a subscription key to its tier quota config."""
+    if not sub_key:
+        return sub_quotas.get("default", {})
+    for prefix, cfg in sub_quotas.items():
+        if prefix == "default":
+            continue
+        if sub_key.startswith(prefix) or sub_key[:8] == prefix[:8]:
+            return cfg
+    return sub_quotas.get("default", {})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Instance pool  (weighted round-robin)
+# ─────────────────────────────────────────────────────────────────────────────
+class InstancePool:
+    def __init__(self):
+        self._cursors: dict[str, int] = defaultdict(int)
+        self._lock = Lock()
+
+    def pick(self, pool_key: str, instances: list[dict],
+             exclude_ids: set | None = None) -> dict | None:
+        available = [
+            i for i in instances
+            if i.get("enabled", True) and (not exclude_ids or i["id"] not in exclude_ids)
+        ]
+        if not available:
+            return None
+        expanded: list[dict] = []
+        for inst in available:
+            for _ in range(max(1, inst.get("weight", 1))):
+                expanded.append(inst)
+        with self._lock:
+            idx = self._cursors[pool_key] % len(expanded)
+            self._cursors[pool_key] = idx + 1
+        return expanded[idx]
+
+
+pool = InstancePool()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Request cache
+# ─────────────────────────────────────────────────────────────────────────────
+class RequestCache:
+    def __init__(self):
+        self._store: dict[str, dict] = {}
+        self._lock = Lock()
+
+    def _key(self, endpoint: str, env: str, model: str, body: bytes) -> str:
+        payload = f"{endpoint}:{env}:{model}:{body.decode('utf-8', errors='replace')}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def get(self, endpoint: str, env: str, model: str, body: bytes, ttl: int) -> dict | None:
+        k = self._key(endpoint, env, model, body)
+        with self._lock:
+            entry = self._store.get(k)
+            if not entry:
+                return None
+            if time.time() - entry["ts"] > ttl:
+                del self._store[k]
+                return None
+            return entry["data"]
+
+    def set(self, endpoint: str, env: str, model: str, body: bytes,
+            data: dict, max_entries: int = 500) -> None:
+        k = self._key(endpoint, env, model, body)
+        with self._lock:
+            if len(self._store) >= max_entries:
+                oldest = min(self._store, key=lambda x: self._store[x]["ts"])
+                del self._store[oldest]
+            self._store[k] = {"ts": time.time(), "data": data}
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+
+cache = RequestCache()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Audit log
+# ─────────────────────────────────────────────────────────────────────────────
+class AuditLog:
+    def __init__(self, maxlen: int = 2000):
+        self._q: deque = deque(maxlen=maxlen)
+        self._lock = Lock()
+
+    def record(self, entry: dict) -> None:
+        with self._lock:
+            self._q.append(entry)
+
+    def recent(self, n: int = 100) -> list:
+        with self._lock:
+            return list(self._q)[-n:]
+
+
+audit = AuditLog()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Environment resolver
+# ─────────────────────────────────────────────────────────────────────────────
+_FORCED_ENV = GATEWAY_ENV.lower() if GATEWAY_ENV else ""
+
+
+def resolve_environment() -> str:
+    if _FORCED_ENV:
+        return _FORCED_ENV
+    env_header = (request.headers.get("X-Environment") or "").lower().strip()
+    if env_header in ("dev", "uat", "prod"):
+        return env_header
+    host = (request.headers.get("X-Forwarded-Host") or request.host or "").lower()
+    sub  = (request.headers.get("Ocp-Apim-Subscription-Key") or "").lower()
+    cfg  = mapping.get()
+    for env_name, hint in cfg.get("apim_environments", {}).items():
+        url_hint = hint.get("apim_url_hint", "").lower()
+        if url_hint and url_hint in host:
+            return env_name
+    for env_name in ("prod", "uat", "dev"):
+        if env_name in sub:
+            return env_name
+    return "dev"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Backend HTTP call
+# ─────────────────────────────────────────────────────────────────────────────
+def call_backend(url: str, api_key: str, body: bytes,
+                 timeout: int, correlation_id: str) -> tuple[int, dict, dict]:
+    headers = {
+        "Content-Type":     "application/json",
+        "Accept":           "application/json",
+        "X-Correlation-Id": correlation_id,
+    }
+    if api_key:
+        headers["api-key"]       = api_key
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = Request(url, data=body, headers=headers, method="POST")
+    try:
+        resp      = urlopen(req, timeout=timeout)
+        resp_body = resp.read()
+        resp_json = json.loads(resp_body)
+        return resp.status, resp_json, dict(resp.headers)
+    except HTTPError as exc:
+        try:
+            err_json = json.loads(exc.read())
+        except Exception:
+            err_json = {"error": {"message": str(exc), "code": exc.code}}
+        return exc.code, err_json, {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Core routing engine  (quota-aware)
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_and_route(
+    endpoint_name: str,
+    env: str,
+    model_id: str,
+    request_body: bytes,
+    correlation_id: str,
+    sub_key: str,
+    cfg: dict,
+) -> tuple[int, dict, dict]:
+
+    endpoints   = cfg.get("endpoints", {})
+    retry_pol   = cfg.get("retry_policy", {})
+    cache_pol   = cfg.get("cache_policy", {})
+    global_rl   = cfg.get("global_rate_limits", {})
+    sub_quotas  = cfg.get("subscription_quotas", {})
+    switch_on   = set(cfg.get("model_switching", {}).get("switch_on_status", [429, 503]))
+    retry_on    = set(retry_pol.get("retry_on_status", [429, 500, 502, 503, 504]))
+    max_att     = retry_pol.get("max_attempts", 3)
+    back_base   = retry_pol.get("backoff_base_seconds", 1.0)
+    back_mult   = retry_pol.get("backoff_multiplier", 2.0)
+    timeout_s   = retry_pol.get("timeout_seconds", 60)
+    cache_ttl   = cache_pol.get("ttl_seconds", 300)
+    cache_on    = cache_pol.get("enabled", True)
+    max_cache   = cache_pol.get("max_entries", 500)
+
+    # ── LEVEL 1: Global rate limit ────────────────────────────────────────
+    glb = global_rl.get("per_endpoint", {})
+    if glb.get("requests_per_minute"):
+        ok, ltype, retry = quota_engine.check(
+            f"global:endpoint:{endpoint_name}:{env}", glb)
+        if not ok:
+            return 429, {
+                "error": "quota_exceeded", "scope": "endpoint",
+                "limit_type": ltype, "retry_after_seconds": retry,
+                "correlation_id": correlation_id,
+            }, {"Retry-After": str(retry)}
+
+    # ── LEVEL 2: Subscription tier quota ─────────────────────────────────
+    tier_cfg = _subscription_tier(sub_key, sub_quotas)
+    if tier_cfg:
+        ok, ltype, retry = quota_engine.check(
+            f"sub:{sub_key[:12] if sub_key else 'anon'}", tier_cfg)
+        if not ok:
+            log.warning("[%s] Subscription quota exceeded (%s)", correlation_id, ltype)
+            return 429, {
+                "error": "subscription_quota_exceeded",
+                "scope": "subscription",
+                "tier": tier_cfg.get("tier", "standard"),
+                "limit_type": ltype,
+                "retry_after_seconds": retry,
+                "correlation_id": correlation_id,
+            }, {"Retry-After": str(retry)}
+
+    # ── Endpoint lookup ───────────────────────────────────────────────────
+    ep_cfg = endpoints.get(endpoint_name)
+    if not ep_cfg:
+        return 404, {"error": "endpoint_not_found",
+                     "message": f"Endpoint '{endpoint_name}' not in mapping",
+                     "available": list(endpoints.keys()),
+                     "correlation_id": correlation_id}, {}
+
+    env_cfg = ep_cfg.get(env)
+    if not env_cfg:
+        return 404, {"error": "env_not_configured",
+                     "message": f"Environment '{env}' not configured for '{endpoint_name}'",
+                     "configured_envs": [k for k in ep_cfg if k != "description"],
+                     "correlation_id": correlation_id}, {}
+
+    # ── LEVEL 3: Endpoint+environment quota ───────────────────────────────
+    ep_quotas = env_cfg.get("quotas", {})
+    if ep_quotas:
+        ok, ltype, retry = quota_engine.check(
+            f"endpoint:{endpoint_name}:{env}", ep_quotas)
+        if not ok:
+            log.warning("[%s] Endpoint quota exceeded (%s)", correlation_id, ltype)
+            return 429, {
+                "error": "endpoint_quota_exceeded",
+                "scope": "endpoint",
+                "endpoint": endpoint_name, "env": env,
+                "limit_type": ltype, "retry_after_seconds": retry,
+                "correlation_id": correlation_id,
+            }, {"Retry-After": str(retry)}
+
+    # ── Cache check ───────────────────────────────────────────────────────
+    if cache_on:
+        cached = cache.get(endpoint_name, env, model_id, request_body, cache_ttl)
+        if cached:
+            log.info("[%s] Cache HIT → %s/%s/%s", correlation_id, endpoint_name, env, model_id)
+            cached["_cached"] = True
+            return 200, cached, {"X-Cache": "HIT"}
+
+    # ── Model chain: requested model + fallbacks ──────────────────────────
+    models_cfg  = env_cfg.get("models", {})
+    model_chain = [model_id]
+    if model_id in models_cfg:
+        for fb in models_cfg[model_id].get("fallback_models", []):
+            if fb not in model_chain:
+                model_chain.append(fb)
+
+    last_status  = 500
+    last_body: dict    = {"error": "all_attempts_exhausted", "correlation_id": correlation_id}
+    last_headers: dict = {}
+
+    for current_model in model_chain:
+        model_cfg = models_cfg.get(current_model)
+        if not model_cfg:
+            log.warning("[%s] Model '%s' not in mapping — skipping", correlation_id, current_model)
+            continue
+
+        # ── LEVEL 4: Model quota ──────────────────────────────────────────
+        m_quotas = model_cfg.get("quotas", {})
+        if m_quotas:
+            ok, ltype, retry = quota_engine.check(
+                f"model:{endpoint_name}:{env}:{current_model}", m_quotas)
+            if not ok:
+                log.warning("[%s] Model quota exceeded for %s (%s)",
+                            correlation_id, current_model, ltype)
+                if current_model == model_chain[-1]:
+                    return 429, {
+                        "error": "model_quota_exceeded",
+                        "scope": "model",
+                        "model": current_model,
+                        "limit_type": ltype,
+                        "retry_after_seconds": retry,
+                        "correlation_id": correlation_id,
+                    }, {"Retry-After": str(retry)}
+                # quota hit on this model → try next fallback
+                log.info("[%s] Model quota hit — switching to next fallback", correlation_id)
+                continue
+
+        instances  = model_cfg.get("instances", [])
+        deployment = model_cfg.get("deployment", current_model)
+        api_ver    = model_cfg.get("api_version", "2024-06-01")
+
+        if not instances:
+            log.warning("[%s] No instances for %s — skipping", correlation_id, current_model)
+            continue
+
+        if current_model != model_id:
+            log.info("[%s] Switching to fallback model: %s", correlation_id, current_model)
+
+        tried: set[str] = set()
+        attempt = 0
+        backoff = back_base
+        pool_key = f"{endpoint_name}:{env}:{current_model}"
+
+        while attempt < max_att:
+            attempt += 1
+            inst = pool.pick(pool_key, instances, tried)
+            if not inst:
+                log.warning("[%s] Instance pool exhausted for %s", correlation_id, current_model)
+                break
+
+            # ── LEVEL 5: Instance quota ───────────────────────────────────
+            inst_quota = inst.get("quota", {})
+            if inst_quota:
+                ok, ltype, retry = quota_engine.instance_check(inst["id"], inst_quota)
+                if not ok:
+                    log.info("[%s] Instance %s quota hit (%s) — trying next",
+                             correlation_id, inst["id"], ltype)
+                    tried.add(inst["id"])
+                    continue   # skip this instance, try another
+
+            raw_url = inst["url"]
+            url = (raw_url
+                   .replace("{deployment}", deployment)
+                   .replace("{model}", current_model)
+                   .replace("{api_version}", api_ver))
+            if "api-version" not in url and api_ver:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}api-version={api_ver}"
+
+            api_key = os.environ.get(inst.get("api_key_env", ""), "")
+
+            log.info("[%s] Att %d/%d  model=%s  instance=%s",
+                     correlation_id, attempt, max_att, current_model, inst["id"])
+
+            try:
+                status, body, resp_hdr = call_backend(
+                    url, api_key, request_body, timeout_s, correlation_id)
+            except TimeoutError:
+                log.warning("[%s] Timeout → %s", correlation_id, inst["id"])
+                tried.add(inst["id"])
+                last_status = 504
+                last_body   = {"error": "backend_timeout", "instance": inst["id"],
+                               "model": current_model, "correlation_id": correlation_id}
+                if attempt < max_att:
+                    time.sleep(backoff); backoff *= back_mult
+                continue
+            except URLError as exc:
+                log.warning("[%s] Network error → %s: %s", correlation_id, inst["id"], exc)
+                tried.add(inst["id"])
+                last_status = 502
+                last_body   = {"error": "backend_unreachable", "instance": inst["id"],
+                               "reason": str(exc), "correlation_id": correlation_id}
+                if attempt < max_att:
+                    time.sleep(backoff); backoff *= back_mult
+                continue
+
+            last_status, last_body, last_headers = status, body, resp_hdr
+
+            if status == 200:
+                body["_routed_to"] = {
+                    "instance": inst["id"], "model": current_model,
+                    "env": env, "url": url,
+                }
+                if cache_on:
+                    cache.set(endpoint_name, env, current_model,
+                              request_body, body, max_cache)
+                return status, body, resp_hdr
+
+            if status in switch_on:
+                log.warning("[%s] Status %s → triggering model switch", correlation_id, status)
+                break   # exit retry loop → try next model
+
+            if status in retry_on:
+                tried.add(inst["id"])
+                if attempt < max_att:
+                    log.info("[%s] Status %s → retry in %.1fs", correlation_id, status, backoff)
+                    time.sleep(backoff); backoff *= back_mult
+                continue
+
+            return status, body, resp_hdr  # non-retryable 4xx
+
+    return last_status, last_body, last_headers
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Flask app
+# ─────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+
+def require_admin(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = request.headers.get("X-Admin-Key") or request.args.get("admin_key")
+        if key != ADMIN_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def apim_auth_check() -> tuple[bool, str]:
+    if TRUST_APIM:
+        return True, "trusted-apim"
+    sub = (request.headers.get("Ocp-Apim-Subscription-Key") or
+           request.args.get("subscription-key") or "")
+    if not sub:
+        return False, "missing-subscription-key"
+    valid_raw = os.environ.get("VALID_SUB_KEYS", "")
+    if valid_raw:
+        if sub not in {k.strip() for k in valid_raw.split(",")}:
+            return False, "invalid-subscription-key"
+    return True, "ok"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/chat", methods=["POST"])
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat():
+    start_ts       = time.perf_counter()
+    correlation_id = (request.headers.get("X-Correlation-Id") or
+                      request.headers.get("X-Request-Id") or
+                      str(uuid.uuid4()))
+
+    allowed, reason = apim_auth_check()
+    if not allowed:
+        return jsonify({"error": "unauthorized", "reason": reason,
+                        "correlation_id": correlation_id}), 401
+
+    try:
+        body = request.get_json(force=True)
+        if not isinstance(body, dict):
+            raise ValueError("Body must be JSON object")
+    except Exception as exc:
+        return jsonify({"error": "invalid_body", "message": str(exc),
+                        "correlation_id": correlation_id}), 400
+
+    endpoint_name = body.get("endpoint",        "").strip()
+    model_id      = body.get("deployment_name", "").strip()
+    provider      = body.get("provider",        "").strip()
+    sub_key       = (request.headers.get("Ocp-Apim-Subscription-Key") or
+                     request.args.get("subscription-key") or "")
+
+    if not endpoint_name:
+        return jsonify({"error": "missing_field", "field": "endpoint",
+                        "correlation_id": correlation_id}), 400
+    if not model_id:
+        return jsonify({"error": "missing_field", "field": "deployment_name",
+                        "correlation_id": correlation_id}), 400
+
+    env = resolve_environment()
+    log.info("[%s] env=%s  endpoint=%s  model=%s  provider=%s",
+             correlation_id, env, endpoint_name, model_id, provider)
+
+    # Strip gateway-only fields before forwarding
+    backend_body = {k: v for k, v in body.items()
+                    if k not in ("endpoint", "provider", "deployment_name", "api_version")}
+    if "model" not in backend_body:
+        backend_body["model"] = model_id
+    backend_bytes = json.dumps(backend_body).encode("utf-8")
+
+    cfg = mapping.get()
+    status, resp_body, resp_hdr = resolve_and_route(
+        endpoint_name, env, model_id, backend_bytes, correlation_id, sub_key, cfg)
+
+    elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+
+    audit.record({
+        "ts":             datetime.now(timezone.utc).isoformat(),
+        "correlation_id": correlation_id,
+        "env":            env,
+        "endpoint":       endpoint_name,
+        "model":          model_id,
+        "provider":       provider,
+        "sub_key_prefix": sub_key[:8] + "***" if sub_key else "none",
+        "status":         status,
+        "latency_ms":     elapsed_ms,
+        "cached":         resp_body.get("_cached", False),
+        "routed_to":      resp_body.get("_routed_to", {}).get("instance"),
+    })
+
+    log.info("[%s] → HTTP %s  %dms%s",
+             correlation_id, status, elapsed_ms,
+             "  [cached]" if resp_body.get("_cached") else "")
+
+    out = jsonify(resp_body)
+    out.status_code = status
+    out.headers["X-Correlation-Id"] = correlation_id
+    out.headers["X-Gateway-Env"]    = env
+    out.headers["X-Latency-Ms"]     = str(elapsed_ms)
+    if resp_body.get("_cached"):
+        out.headers["X-Cache"] = "HIT"
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Health
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/health")
+def health():
+    cfg = mapping.get()
+    return jsonify({
+        "status":           "ok",
+        "service":          "ai-gateway",
+        "version":          "2.0.0",
+        "environment":      _FORCED_ENV or "auto-detect",
+        "endpoints_loaded": len(cfg.get("endpoints", {})),
+        "cache_entries":    cache.size(),
+        "trust_apim":       TRUST_APIM,
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Config API
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/config/mapping", methods=["GET"])
+@require_admin
+def get_mapping():
+    return jsonify(mapping.get())
+
+
+@app.route("/config/mapping/reload", methods=["POST"])
+@require_admin
+def reload_mapping():
+    mapping.load()
+    return jsonify({"ok": True})
+
+
+@app.route("/config/endpoints", methods=["GET"])
+@require_admin
+def list_endpoints():
+    cfg = mapping.get()
+    out = {}
+    for name, ep in cfg.get("endpoints", {}).items():
+        out[name] = {
+            "description": ep.get("description", ""),
+            "environments": {
+                env: {
+                    "provider": edata.get("provider"),
+                    "models":   list(edata.get("models", {}).keys()),
+                    "quotas":   edata.get("quotas", {}),
+                }
+                for env, edata in ep.items()
+                if env != "description" and isinstance(edata, dict)
+            },
+        }
+    return jsonify(out)
+
+
+@app.route("/config/endpoints/<endpoint_name>/<env>", methods=["PUT"])
+@require_admin
+def upsert_endpoint_env(endpoint_name: str, env: str):
+    body = request.get_json(force=True)
+    mapping.upsert_endpoint(endpoint_name, env, body)
+    return jsonify({"ok": True, "endpoint": endpoint_name, "env": env})
+
+
+@app.route("/config/endpoints/<endpoint_name>/<env>/instances/<instance_id>", methods=["PATCH"])
+@require_admin
+def patch_instance(endpoint_name: str, env: str, instance_id: str):
+    patch = request.get_json(force=True)
+    cfg   = mapping.get()
+    found = False
+    for ep_name, ep in cfg.get("endpoints", {}).items():
+        if ep_name != endpoint_name:
+            continue
+        for env_name, env_cfg in ep.items():
+            if env_name != env or not isinstance(env_cfg, dict):
+                continue
+            for model_cfg in env_cfg.get("models", {}).values():
+                for inst in model_cfg.get("instances", []):
+                    if inst.get("id") == instance_id:
+                        inst.update(patch)
+                        found = True
+    if not found:
+        return jsonify({"error": "instance_not_found"}), 404
+    with mapping._lock:
+        mapping._data = cfg
+    mapping.save()
+    return jsonify({"ok": True})
+
+
+@app.route("/config/cache/clear", methods=["POST"])
+@require_admin
+def clear_cache():
+    cache.clear()
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Quota stats API
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/admin/quota-stats")
+@require_admin
+def quota_stats():
+    """
+    Returns current quota window usage for all configured endpoints + models.
+    Use this to build quota dashboards or alerts.
+    """
+    cfg  = mapping.get()
+    out  = {}
+    envs = ["dev", "uat", "prod"]
+    for ep_name, ep in cfg.get("endpoints", {}).items():
+        out[ep_name] = {}
+        for env in envs:
+            env_cfg = ep.get(env)
+            if not env_cfg or not isinstance(env_cfg, dict):
+                continue
+            ep_stats = {
+                "endpoint_window": quota_engine.stats(f"endpoint:{ep_name}:{env}"),
+                "models": {},
+            }
+            for m_name, m_cfg in env_cfg.get("models", {}).items():
+                m_stats = {
+                    "model_window": quota_engine.stats(f"model:{ep_name}:{env}:{m_name}"),
+                    "instances": {},
+                }
+                for inst in m_cfg.get("instances", []):
+                    m_stats["instances"][inst["id"]] = quota_engine.stats(
+                        f"instance:{inst['id']}")
+                ep_stats["models"][m_name] = m_stats
+            out[ep_name][env] = ep_stats
+    return jsonify(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Audit & stats
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/admin/logs")
+@require_admin
+def get_logs():
+    n = min(int(request.args.get("n", 100)), 2000)
+    return jsonify({"logs": audit.recent(n)})
+
+
+@app.route("/admin/stats")
+@require_admin
+def get_stats():
+    from collections import Counter
+    logs = audit.recent(2000)
+    if not logs:
+        return jsonify({"total": 0})
+    by_env    = Counter(e.get("env")      for e in logs)
+    by_ep     = Counter(e.get("endpoint") for e in logs)
+    by_model  = Counter(e.get("model")    for e in logs)
+    by_status = Counter(str(e.get("status")) for e in logs)
+    lats      = [e["latency_ms"] for e in logs if e.get("latency_ms")]
+    cached    = sum(1 for e in logs if e.get("cached"))
+    return jsonify({
+        "total_requests":       len(logs),
+        "cached_responses":     cached,
+        "cache_hit_rate":       f"{cached/len(logs)*100:.1f}%" if logs else "0%",
+        "avg_latency_ms":       int(sum(lats)/len(lats)) if lats else 0,
+        "p95_latency_ms":       int(sorted(lats)[int(len(lats)*0.95)]) if lats else 0,
+        "errors":               sum(1 for e in logs if (e.get("status") or 0) >= 400),
+        "quota_rejections":     sum(1 for e in logs if e.get("status") == 429),
+        "requests_by_env":      dict(by_env),
+        "requests_by_endpoint": dict(by_ep),
+        "requests_by_model":    dict(by_model),
+        "requests_by_status":   dict(by_status),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Admin UI
+# ─────────────────────────────────────────────────────────────────────────────
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Gateway v2 — Admin</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;600;800&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#09090b;--bg2:#18181b;--bg3:#27272a;--bd:#3f3f46;--blue:#60a5fa;--green:#4ade80;--red:#f87171;--amber:#fbbf24;--text:#fafafa;--muted:#a1a1aa;--purple:#c084fc}
+body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{background:var(--bg2);border-bottom:1px solid var(--bd);padding:.9rem 2rem;display:flex;align-items:center;gap:.85rem}
+header h1{font-size:1.05rem;font-weight:800;letter-spacing:-.03em}
+.badge{font-family:'JetBrains Mono',monospace;font-size:.67rem;padding:.16rem .5rem;border-radius:4px}
+.bl{background:#1e3a5f;border:1px solid #2563eb44;color:var(--blue)}
+.gl{background:#14342a;border:1px solid #16a34a44;color:var(--green)}
+.al{background:#3b2200;border:1px solid #d97706;color:var(--amber)}
+.layout{display:grid;grid-template-columns:205px 1fr;min-height:calc(100vh - 50px)}
+nav{background:var(--bg2);border-right:1px solid var(--bd);padding:1.5rem 0}
+nav a{display:flex;align-items:center;gap:.5rem;padding:.5rem 1.25rem;color:var(--muted);text-decoration:none;font-size:.83rem;font-weight:600;border-left:2px solid transparent;transition:.1s}
+nav a:hover,nav a.active{color:var(--text);border-left-color:var(--blue);background:#1e1e2a}
+main{padding:1.75rem;overflow:auto}
+.panel{display:none}.panel.active{display:block}
+h2{font-size:.95rem;font-weight:800;margin-bottom:1.1rem;letter-spacing:-.02em}
+.sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:.65rem;margin-bottom:1.25rem}
+.stat{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:.9rem}
+.stat .v{font-family:'JetBrains Mono',monospace;font-size:1.65rem;font-weight:600;margin-bottom:.12rem}
+.stat .l{font-size:.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+table{width:100%;border-collapse:collapse;font-size:.78rem}
+th{text-align:left;padding:.42rem .7rem;color:var(--muted);font-size:.67rem;text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid var(--bd)}
+td{padding:.52rem .7rem;border-bottom:1px solid #27272a;font-family:'JetBrains Mono',monospace;font-size:.76rem}
+tr:hover td{background:#18181b}
+.pill{display:inline-block;padding:.11rem .42rem;border-radius:10px;font-size:.67rem;font-weight:700;font-family:'JetBrains Mono',monospace}
+.pg{background:#14342a;color:var(--green);border:1px solid #16a34a33}
+.pr{background:#3b1111;color:var(--red);border:1px solid #f8717133}
+.pa{background:#3b2200;color:var(--amber);border:1px solid #fbbf2433}
+.pb{background:#1e3a5f;color:var(--blue);border:1px solid #60a5fa33}
+.pm{background:var(--bg3);color:var(--muted);border:1px solid var(--bd)}
+button,.btn{font-family:'Outfit',sans-serif;font-weight:600;font-size:.78rem;padding:.38rem .8rem;border-radius:6px;border:1px solid var(--bd);background:var(--bg3);color:var(--text);cursor:pointer;transition:.1s}
+button:hover{background:#3f3f46}
+.bp{background:var(--blue);color:#000;border-color:var(--blue)}.bp:hover{opacity:.85}
+.card{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:1.15rem;margin-bottom:.75rem}
+pre{font-family:'JetBrains Mono',monospace;font-size:.75rem;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:.8rem;overflow:auto;max-height:360px;line-height:1.6;white-space:pre-wrap}
+input,select,textarea{width:100%;padding:.42rem .65rem;background:var(--bg);border:1px solid var(--bd);color:var(--text);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:.76rem;margin-bottom:.5rem}
+label{font-size:.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:.22rem}
+.row{display:flex;gap:.6rem}.col{flex:1}
+.quota-bar-bg{background:var(--bg3);border-radius:4px;height:6px;margin-top:4px;overflow:hidden}
+.quota-bar{height:6px;border-radius:4px;transition:width .4s}
+.env-tag{display:inline-block;padding:.11rem .38rem;border-radius:4px;font-size:.65rem;font-weight:700;font-family:'JetBrains Mono',monospace;text-transform:uppercase}
+.e-dev{background:#1e3a5f;color:var(--blue)}.e-uat{background:#2e1b44;color:var(--purple)}.e-prod{background:#14342a;color:var(--green)}
+#toast{position:fixed;bottom:1.25rem;right:1.25rem;padding:.6rem 1rem;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;font-size:.78rem;opacity:0;pointer-events:none;transition:opacity .3s;box-shadow:0 8px 32px #0009;z-index:100}
+#toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ AI Gateway <span style="font-size:.75rem;color:var(--muted);font-weight:400">v2</span></h1>
+  <span class="badge bl" id="hbadge">…</span>
+  <span class="badge al" id="envbadge">ENV</span>
+  <span style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:.7rem;color:var(--muted)" id="clk"></span>
+</header>
+<div class="layout">
+<nav>
+  <a href="#" class="active" onclick="sw('dashboard',this)">📊 Dashboard</a>
+  <a href="#" onclick="sw('quotas',this)">🎯 Quota stats</a>
+  <a href="#" onclick="sw('routing',this)">🗺 Routing map</a>
+  <a href="#" onclick="sw('logs',this)">📋 Audit logs</a>
+  <a href="#" onclick="sw('test',this)">🧪 Test request</a>
+  <a href="#" onclick="sw('apim',this)">🔌 APIM guide</a>
+</nav>
+<main>
+
+<div id="p-dashboard" class="panel active">
+  <h2>Dashboard</h2>
+  <div class="sg">
+    <div class="stat"><div class="v" id="s-total">—</div><div class="l">Requests</div></div>
+    <div class="stat"><div class="v" id="s-429" style="color:var(--amber)">—</div><div class="l">Quota rejections</div></div>
+    <div class="stat"><div class="v" id="s-cache" style="color:var(--blue)">—</div><div class="l">Cache hit rate</div></div>
+    <div class="stat"><div class="v" id="s-lat">—</div><div class="l">Avg latency ms</div></div>
+    <div class="stat"><div class="v" id="s-err" style="color:var(--red)">—</div><div class="l">Errors</div></div>
+  </div>
+  <div class="card">
+    <h2>Recent requests</h2>
+    <table><thead><tr><th>Time</th><th>Env</th><th>Endpoint</th><th>Model</th><th>Status</th><th>Latency</th><th>Cache</th><th>Instance</th></tr></thead>
+    <tbody id="dash-tbody"></tbody></table>
+  </div>
+</div>
+
+<div id="p-quotas" class="panel">
+  <h2>Quota stats <button onclick="loadQuotas()" style="float:right">Refresh</button></h2>
+  <div id="quota-content"></div>
+</div>
+
+<div id="p-routing" class="panel">
+  <h2>Routing map <button onclick="loadRouting()" style="float:right">Refresh</button></h2>
+  <div id="routing-content"></div>
+</div>
+
+<div id="p-logs" class="panel">
+  <h2>Audit logs <button onclick="loadLogs()" style="float:right">Refresh</button></h2>
+  <table><thead><tr><th>Time</th><th>Corr ID</th><th>Env</th><th>Endpoint</th><th>Model</th><th>Status</th><th>Latency</th><th>Cached</th><th>Instance</th></tr></thead>
+  <tbody id="logs-tbody"></tbody></table>
+</div>
+
+<div id="p-test" class="panel">
+  <h2>Test request</h2>
+  <div class="card">
+    <div class="row">
+      <div class="col"><label>Endpoint</label><input id="t-ep" value="abc"/></div>
+      <div class="col"><label>Environment</label><select id="t-env"><option>dev</option><option>uat</option><option>prod</option></select></div>
+    </div>
+    <div class="row">
+      <div class="col"><label>Deployment name</label><input id="t-model" value="gpt-4o"/></div>
+      <div class="col"><label>Provider</label><input id="t-prov" value="OpenAI"/></div>
+    </div>
+    <div class="row">
+      <div class="col"><label>Subscription key (optional)</label><input id="t-subkey" placeholder="Ocp-Apim-Subscription-Key"/></div>
+    </div>
+    <label>Messages</label>
+    <textarea id="t-msgs" rows="3">[{"role":"user","content":"Hello! Describe yourself briefly."}]</textarea>
+    <button class="bp" onclick="sendTest()">Send</button>
+    <button onclick="clearTest()" style="margin-left:.5rem">Clear</button>
+  </div>
+  <div id="test-result" style="display:none" class="card">
+    <h2 style="margin-bottom:.7rem">Response <span id="test-meta" style="font-size:.72rem;color:var(--muted);font-family:'JetBrains Mono',monospace"></span></h2>
+    <pre id="test-out"></pre>
+  </div>
+</div>
+
+<div id="p-apim" class="panel">
+  <h2>APIM integration guide</h2>
+  <div class="card">
+    <h2 style="margin-bottom:.7rem">Minimal APIM inbound policy</h2>
+    <p style="color:var(--muted);font-size:.8rem;margin-bottom:.75rem">Set one policy per APIM instance (dev / uat / prod). Only change the X-Environment value.</p>
+    <pre id="apim-snip"></pre>
+  </div>
+  <div class="card">
+    <h2 style="margin-bottom:.7rem">Consumer request format</h2>
+    <pre>{
+  "endpoint":        "abc",
+  "provider":        "OpenAI",
+  "deployment_name": "gpt-4o",
+  "api_version":     "2024-06-01",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "max_tokens": 512,
+  "temperature": 0.7
+}</pre>
+  </div>
+  <div class="card">
+    <h2 style="margin-bottom:.7rem">Quota levels enforced by the gateway</h2>
+    <table>
+      <thead><tr><th>Level</th><th>Scope</th><th>Configured in</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Global per-endpoint RPM</td><td>global_rate_limits.per_endpoint</td></tr>
+        <tr><td>2</td><td>Subscription tier (standard / premium / internal)</td><td>subscription_quotas.*</td></tr>
+        <tr><td>3</td><td>Endpoint + environment</td><td>endpoints.{name}.{env}.quotas</td></tr>
+        <tr><td>4</td><td>Per model/deployment</td><td>endpoints.{name}.{env}.models.{m}.quotas</td></tr>
+        <tr><td>5</td><td>Per backend instance (RPM + TPM)</td><td>endpoints…instances[].quota</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <button onclick="doReloadMapping()">🔄 Reload mapping from disk</button>
+    <button onclick="doClearCache()" style="margin-left:.5rem">🗑 Clear cache</button>
+    <span id="action-status" style="margin-left:1rem;font-size:.78rem;color:var(--muted)"></span>
+  </div>
+</div>
+
+</main>
+</div>
+<div id="toast"></div>
+<script>
+const AK='{{ admin_key }}';
+function api(m,p,b){return fetch(p,{method:m,headers:{'X-Admin-Key':AK,'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined}).then(r=>r.json())}
+function toast(msg,ok=true){const e=document.getElementById('toast');e.textContent=msg;e.style.borderColor=ok?'var(--green)':'var(--red)';e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2800)}
+function sw(p,el){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.querySelectorAll('nav a').forEach(x=>x.classList.remove('active'));document.getElementById('p-'+p).classList.add('active');if(el)el.classList.add('active');if(p==='dashboard')loadDash();if(p==='quotas')loadQuotas();if(p==='routing')loadRouting();if(p==='logs')loadLogs();if(p==='apim')loadApim()}
+function spill(s){if(!s)return'<span class="pill pm">-</span>';const c=s<300?'pg':s===429?'pa':s<500?'pa':'pr';return`<span class="pill ${c}">${s}</span>`}
+function envpill(e){const c={'dev':'e-dev','uat':'e-uat','prod':'e-prod'}[e]||'';return`<span class="env-tag ${c}">${e||'?'}</span>`}
+
+async function loadDash(){
+  const[stats,logs]=await Promise.all([api('GET','/admin/stats'),api('GET','/admin/logs?n=20')]);
+  document.getElementById('s-total').textContent=stats.total_requests||0;
+  document.getElementById('s-429').textContent=stats.quota_rejections||0;
+  document.getElementById('s-cache').textContent=stats.cache_hit_rate||'0%';
+  document.getElementById('s-lat').textContent=stats.avg_latency_ms||0;
+  document.getElementById('s-err').textContent=stats.errors||0;
+  document.getElementById('dash-tbody').innerHTML=(logs.logs||[]).slice(-15).reverse().map(e=>`<tr>
+    <td>${e.ts.split('T')[1].substring(0,8)}</td>
+    <td>${envpill(e.env)}</td><td>${e.endpoint||'-'}</td><td>${e.model||'-'}</td>
+    <td>${spill(e.status)}</td><td>${e.latency_ms!=null?e.latency_ms+'ms':'-'}</td>
+    <td>${e.cached?'<span class="pill pb">HIT</span>':'<span class="pill pm">MISS</span>'}</td>
+    <td style="color:var(--muted);font-size:.7rem">${e.routed_to||'-'}</td>
+  </tr>`).join('')
+}
+
+async function loadQuotas(){
+  const data=await api('GET','/admin/quota-stats');
+  let html='';
+  for(const[ep,envs]of Object.entries(data||{})){
+    html+=`<div class="card"><h2 style="margin-bottom:.8rem">📦 ${ep}</h2>`;
+    for(const[env,edata]of Object.entries(envs||{})){
+      html+=`<div style="margin-bottom:.6rem"><span class="env-tag ${'e-'+env}">${env}</span>`;
+      html+=` <span style="font-size:.72rem;color:var(--muted)">endpoint: ${edata.endpoint_window?.last_60s||0} req/60s  ·  ${edata.endpoint_window?.today||0} today</span></div>`;
+      html+='<table style="margin-bottom:.75rem"><thead><tr><th>Model</th><th>Req/60s</th><th>Today</th><th>Instances</th></tr></thead><tbody>';
+      for(const[m,mdata]of Object.entries(edata.models||{})){
+        const insts=Object.entries(mdata.instances||{}).map(([id,s])=>`${id}: ${s.last_60s}/60s`).join(' | ');
+        html+=`<tr><td>${m}</td><td>${mdata.model_window?.last_60s||0}</td><td>${mdata.model_window?.today||0}</td><td style="color:var(--muted);font-size:.72rem">${insts||'-'}</td></tr>`;
+      }
+      html+='</tbody></table>';
+    }
+    html+='</div>';
+  }
+  document.getElementById('quota-content').innerHTML=html||'<p style="color:var(--muted)">No data</p>';
+}
+
+async function loadRouting(){
+  const data=await api('GET','/config/endpoints');
+  let html='';
+  for(const[name,ep]of Object.entries(data||{})){
+    html+=`<div class="card"><h2 style="margin-bottom:.6rem">📦 ${name} <span style="font-size:.78rem;color:var(--muted);font-weight:400">${ep.description||''}</span></h2><div style="display:flex;gap:.65rem;flex-wrap:wrap">`;
+    for(const[env,edata]of Object.entries(ep.environments||{})){
+      const q=edata.quotas||{};
+      html+=`<div style="flex:1;min-width:190px;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:.8rem">
+        <div style="margin-bottom:.45rem">${envpill(env)} <span style="font-size:.72rem;color:var(--muted)">${edata.provider||''}</span></div>
+        ${q.requests_per_minute?`<div style="font-size:.7rem;color:var(--muted)">RPM: ${q.requests_per_minute} · RPD: ${q.requests_per_day||'∞'} · TPM: ${q.tokens_per_minute||'∞'}</div>`:''}
+        ${(edata.models||[]).map(m=>`<div style="font-family:'JetBrains Mono',monospace;font-size:.72rem;padding:.18rem .45rem;background:var(--bg2);border-radius:4px;margin:.18rem 0">${m}</div>`).join('')}
+      </div>`;
+    }
+    html+='</div></div>';
+  }
+  document.getElementById('routing-content').innerHTML=html||'<p style="color:var(--muted)">No endpoints</p>';
+}
+
+async function loadLogs(){
+  const data=await api('GET','/admin/logs?n=200');
+  document.getElementById('logs-tbody').innerHTML=(data.logs||[]).reverse().map(e=>`<tr>
+    <td>${e.ts.replace('T',' ').substring(0,19)}</td>
+    <td style="color:var(--muted);font-size:.7rem">${(e.correlation_id||'').substring(0,8)}…</td>
+    <td>${envpill(e.env)}</td><td>${e.endpoint||'-'}</td><td>${e.model||'-'}</td>
+    <td>${spill(e.status)}</td><td>${e.latency_ms!=null?e.latency_ms+'ms':'-'}</td>
+    <td>${e.cached?'<span class="pill pb">HIT</span>':'<span class="pill pm">MISS</span>'}</td>
+    <td style="color:var(--muted);font-size:.7rem">${e.routed_to||'-'}</td>
+  </tr>`).join('')
+}
+
+async function sendTest(){
+  const ep=document.getElementById('t-ep').value;
+  const env=document.getElementById('t-env').value;
+  const model=document.getElementById('t-model').value;
+  const prov=document.getElementById('t-prov').value;
+  const subkey=document.getElementById('t-subkey').value;
+  let msgs;try{msgs=JSON.parse(document.getElementById('t-msgs').value)}catch(e){toast('Invalid JSON',false);return}
+  const hdrs={'Content-Type':'application/json','X-Environment':env};
+  if(subkey)hdrs['Ocp-Apim-Subscription-Key']=subkey;
+  const t0=Date.now();
+  const resp=await fetch('/chat',{method:'POST',headers:hdrs,body:JSON.stringify({endpoint:ep,provider:prov,deployment_name:model,messages:msgs})});
+  const lat=Date.now()-t0;
+  let txt;try{txt=JSON.stringify(await resp.json(),null,2)}catch(_){txt=await resp.text()}
+  document.getElementById('test-meta').textContent=`HTTP ${resp.status} · ${lat}ms · cache:${resp.headers.get('X-Cache')||'MISS'}`;
+  document.getElementById('test-out').textContent=txt;
+  document.getElementById('test-result').style.display='block';
+}
+function clearTest(){document.getElementById('test-result').style.display='none'}
+
+function loadApim(){
+  const host=window.location.origin;
+  document.getElementById('apim-snip').textContent=
+`<policies>
+  <inbound>
+    <base />
+
+    <!-- Consumer-level quota (set per APIM product/subscription) -->
+    <rate-limit calls="60" renewal-period="60" />
+    <quota calls="5000" renewal-period="86400" />
+
+    <!-- Tell the gateway which environment this is -->
+    <set-header name="X-Environment" exists-action="override">
+      <value>prod</value>   <!-- change to dev / uat / prod per instance -->
+    </set-header>
+
+    <!-- Mark request as APIM-validated (skip gateway key re-check) -->
+    <set-header name="X-APIM-Validated" exists-action="override">
+      <value>true</value>
+    </set-header>
+
+    <!-- Correlation ID for end-to-end tracing -->
+    <set-header name="X-Correlation-Id" exists-action="skip">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
+
+    <!-- Route to this gateway -->
+    <set-backend-service base-url="${host}" />
+  </inbound>
+  <!-- No <backend> or <outbound> policies needed -->
+</policies>`;
+}
+
+async function doReloadMapping(){
+  await api('POST','/config/mapping/reload');
+  toast('Mapping reloaded');
+  document.getElementById('action-status').textContent='Reloaded at '+new Date().toLocaleTimeString();
+}
+async function doClearCache(){
+  await api('POST','/config/cache/clear');
+  toast('Cache cleared');
+  document.getElementById('action-status').textContent='Cache cleared at '+new Date().toLocaleTimeString();
+}
+
+async function ping(){
+  try{
+    const d=await fetch('/health').then(r=>r.json());
+    const e=document.getElementById('hbadge');
+    e.textContent=d.status==='ok'?'● healthy':'● degraded';
+    e.className='badge '+(d.status==='ok'?'gl':'al');
+    document.getElementById('envbadge').textContent='ENV: '+(d.environment||'auto');
+  }catch(_){}
+}
+setInterval(()=>{document.getElementById('clk').textContent=new Date().toISOString().replace('T',' ').substring(0,19)+' UTC'},1000);
+ping();setInterval(ping,15000);loadDash();
+</script>
+</body></html>"""
+
+
+@app.route("/admin")
+def admin_ui():
+    return render_template_string(ADMIN_HTML, admin_key=ADMIN_KEY)
+
+
+@app.route("/")
+def index():
+    return jsonify({
+        "service": "ai-gateway", "version": "2.0.0",
+        "endpoints": {
+            "POST /chat":                    "Main gateway (intelligent routing + quota)",
+            "POST /v1/chat/completions":     "OpenAI-compatible alias",
+            "GET  /health":                  "Health check",
+            "GET  /admin":                   "Admin UI",
+            "GET  /admin/quota-stats":       "Live quota window usage (admin)",
+            "GET  /admin/stats":             "Request statistics (admin)",
+            "GET  /admin/logs":              "Audit log (admin)",
+            "GET  /config/endpoints":        "Endpoint summary (admin)",
+            "GET  /config/mapping":          "Full mapping JSON (admin)",
+            "POST /config/mapping/reload":   "Hot-reload mapping (admin)",
+            "POST /config/cache/clear":      "Clear request cache (admin)",
+        },
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--host",  default="0.0.0.0")
+    p.add_argument("--port",  type=int, default=8000)
+    p.add_argument("--env",   default="", help="Force environment: dev|uat|prod")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
+
+    if args.env:
+        os.environ["GATEWAY_ENV"] = args.env
+
+    log.info("=" * 62)
+    log.info("  AI Gateway  v2.0.0")
+    log.info("  http://%s:%s", args.host, args.port)
+    log.info("  Mapping : %s", MAPPING_FILE)
+    log.info("  Env     : %s", os.environ.get("GATEWAY_ENV") or "auto-detect")
+    log.info("  Admin UI: http://%s:%s/admin", args.host, args.port)
+    log.info("=" * 62)
+
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
