@@ -1,1 +1,73 @@
+how it works conceptually, then the complete Python code.
+The idea is to scan Salesforce's metadata API (which returns every object's field definitions without touching real data), then optionally sample a few hundred records per object to enrich the model with actual cardinality and null rates. Together they produce a complete entity model you can export as JSON or visualize.
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetNow the full Python code — install with pip install simple-salesforce:Ran 2 commands, created a file, read a fileRan 2 commands, created a file, read a fileHere's how the whole thing works, step by step.
 
+What each stage does
+Object scan
+Calls sf.describe() which hits /services/data/vXX/sobjects/. This returns a lightweight list of every object in the org — name, label, whether it's queryable, custom, createable, etc. No record data is touched. Filters then apply: --objects Account,Contact, --custom-only, or skip non-queryable internal objects.
+Field describe
+For each object calls /sobjects/{name}/describe/ via sf_obj.describe(). This returns every field's complete metadata: name, type, length, nullability, picklist values, and crucially for entity modelling — referenceTo (which object a lookup points to) and type=reference which identifies all foreign keys. The code also extracts childRelationships — the reverse side, meaning what objects point to this one.
+Data sampling
+Runs SELECT COUNT() FROM {object} to get total records, then SELECT {fields} FROM {object} LIMIT N. For each field it computes:
+
+null_rate — fraction of sampled records where the field is null
+distinct_count — number of unique values seen
+sample_min / sample_max — for numeric and date fields
+
+Salesforce has a 100-field-per-SOQL limit, so the code chunks the field list in groups of 80.
+Entity model assembly
+Deduplicates all relationships into a single index, categorises field types (identity, relationship, text, numeric, categorical, temporal), and generates four outputs.
+
+Run it
+bashpip install simple-salesforce
+
+# Metadata only (fast — no records accessed)
+python sf_entity_model.py \
+  --username you@company.com \
+  --password yourpassword \
+  --token yourToken
+
+# With sampling — 200 records per object
+python sf_entity_model.py \
+  --username you@company.com \
+  --password yourpassword \
+  --token yourToken \
+  --sample 200
+
+# Specific objects only
+python sf_entity_model.py ... --objects Account,Contact,Opportunity,Lead,Case
+
+# Sandbox
+python sf_entity_model.py ... --domain test
+```
+
+---
+
+## Outputs
+
+| File | Content |
+|---|---|
+| `entities.json` | Full entity model — every object with all fields, types, relationships, null rates |
+| `relationships.json` | Flat list of all lookup/master-detail links between objects |
+| `entity_model.md` | Mermaid ERD — paste into GitHub, Notion, or Confluence |
+| `fields.csv` | Field catalog — open in Excel or load into a data catalog tool |
+
+The Mermaid ERD looks like this when rendered:
+```
+erDiagram
+  Account {
+    ID Id PK
+    REFERENCE OwnerId FK
+    STRING Name
+  }
+  Contact {
+    ID Id PK
+    REFERENCE AccountId FK
+  }
+  Contact }o--o| Account : "AccountId"Sf entity modelPY Open in IDLE
