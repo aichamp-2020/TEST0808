@@ -1,1 +1,422 @@
 
+{
+  "endpoints": {
+    "abc": {
+      "description": "Primary OpenAI endpoint group",
+
+      "dev": {
+        "provider": "OpenAI",
+        "quotas": {
+          "requests_per_minute": 30,
+          "requests_per_day": 1000,
+          "tokens_per_minute": 40000
+        },
+        "models": {
+          "gpt-4o": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-4o",
+            "quotas": {
+              "requests_per_minute": 20,
+              "requests_per_day": 500,
+              "tokens_per_minute": 20000
+            },
+            "instances": [
+              {
+                "id": "dev-oai-1",
+                "url": "https://dev-openai-01.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_DEV_1",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 60,
+                  "tpm_limit": 40000
+                }
+              }
+            ],
+            "fallback_models": ["gpt-35-turbo"]
+          },
+          "gpt-35-turbo": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-35-turbo",
+            "quotas": {
+              "requests_per_minute": 60,
+              "requests_per_day": 2000,
+              "tokens_per_minute": 80000
+            },
+            "instances": [
+              {
+                "id": "dev-oai-fallback-1",
+                "url": "https://dev-openai-01.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_DEV_1",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 120,
+                  "tpm_limit": 80000
+                }
+              }
+            ],
+            "fallback_models": []
+          }
+        }
+      },
+
+      "uat": {
+        "provider": "OpenAI",
+        "quotas": {
+          "requests_per_minute": 60,
+          "requests_per_day": 5000,
+          "tokens_per_minute": 80000
+        },
+        "models": {
+          "gpt-4o": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-4o",
+            "quotas": {
+              "requests_per_minute": 40,
+              "requests_per_day": 2000,
+              "tokens_per_minute": 40000
+            },
+            "instances": [
+              {
+                "id": "uat-oai-1",
+                "url": "https://uat-openai-01.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_UAT_1",
+                "weight": 2,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 240,
+                  "tpm_limit": 80000
+                }
+              },
+              {
+                "id": "uat-oai-2",
+                "url": "https://uat-openai-02.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_UAT_2",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 120,
+                  "tpm_limit": 40000
+                }
+              }
+            ],
+            "fallback_models": ["gpt-35-turbo"]
+          },
+          "gpt-35-turbo": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-35-turbo",
+            "quotas": {
+              "requests_per_minute": 120,
+              "requests_per_day": 10000,
+              "tokens_per_minute": 160000
+            },
+            "instances": [
+              {
+                "id": "uat-35-1",
+                "url": "https://uat-openai-01.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_UAT_1",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 480,
+                  "tpm_limit": 160000
+                }
+              }
+            ],
+            "fallback_models": []
+          }
+        }
+      },
+
+      "prod": {
+        "provider": "OpenAI",
+        "quotas": {
+          "requests_per_minute": 200,
+          "requests_per_day": 50000,
+          "tokens_per_minute": 400000
+        },
+        "models": {
+          "gpt-4o": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-4o",
+            "quotas": {
+              "requests_per_minute": 100,
+              "requests_per_day": 20000,
+              "tokens_per_minute": 200000
+            },
+            "instances": [
+              {
+                "id": "prod-oai-1",
+                "url": "https://prod-openai-01.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_PROD_1",
+                "weight": 2,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 480,
+                  "tpm_limit": 150000
+                }
+              },
+              {
+                "id": "prod-oai-2",
+                "url": "https://prod-openai-02.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_PROD_2",
+                "weight": 2,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 480,
+                  "tpm_limit": 150000
+                }
+              },
+              {
+                "id": "prod-oai-3",
+                "url": "https://prod-openai-03.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_PROD_3",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 240,
+                  "tpm_limit": 80000
+                }
+              }
+            ],
+            "fallback_models": ["gpt-4-turbo", "gpt-35-turbo"]
+          },
+          "gpt-4-turbo": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-4-turbo",
+            "quotas": {
+              "requests_per_minute": 60,
+              "requests_per_day": 10000,
+              "tokens_per_minute": 100000
+            },
+            "instances": [
+              {
+                "id": "prod-turbo-1",
+                "url": "https://prod-openai-04.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_PROD_4",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 240,
+                  "tpm_limit": 100000
+                }
+              }
+            ],
+            "fallback_models": ["gpt-35-turbo"]
+          },
+          "gpt-35-turbo": {
+            "api_version": "2024-06-01",
+            "deployment": "gpt-35-turbo",
+            "quotas": {
+              "requests_per_minute": 300,
+              "requests_per_day": 50000,
+              "tokens_per_minute": 600000
+            },
+            "instances": [
+              {
+                "id": "prod-35-1",
+                "url": "https://prod-openai-04.openai.azure.com/openai/deployments/{deployment}/chat/completions",
+                "api_key_env": "OPENAI_KEY_PROD_4",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 960,
+                  "tpm_limit": 600000
+                }
+              }
+            ],
+            "fallback_models": []
+          }
+        }
+      }
+    },
+
+    "internal-smoldm2": {
+      "description": "Internal SmolDM2 SLM pool",
+
+      "dev": {
+        "provider": "SmolDM2",
+        "quotas": {
+          "requests_per_minute": 60,
+          "requests_per_day": 5000,
+          "tokens_per_minute": 100000
+        },
+        "models": {
+          "smoldm2-1.7b": {
+            "api_version": "v1",
+            "deployment": "smoldm2-1.7b",
+            "quotas": {
+              "requests_per_minute": 60,
+              "requests_per_day": 5000,
+              "tokens_per_minute": 100000
+            },
+            "instances": [
+              {
+                "id": "dev-slm-1",
+                "url": "http://dev-slm-01.internal:8080/v1/chat/completions",
+                "api_key_env": "SLM_KEY_DEV_1",
+                "weight": 1,
+                "enabled": true,
+                "quota": {
+                  "rpm_limit": 120,
+                  "tpm_limit": 200000
+                }
+              }
+            ],
+            "fallback_models": []
+          }
+        }
+      },
+
+      "uat": {
+        "provider": "SmolDM2",
+        "quotas": {
+          "requests_per_minute": 120,
+          "requests_per_day": 20000,
+          "tokens_per_minute": 300000
+        },
+        "models": {
+          "smoldm2-1.7b": {
+            "api_version": "v1",
+            "deployment": "smoldm2-1.7b",
+            "quotas": {
+              "requests_per_minute": 120,
+              "requests_per_day": 20000,
+              "tokens_per_minute": 300000
+            },
+            "instances": [
+              {
+                "id": "uat-slm-1",
+                "url": "http://uat-slm-01.internal:8080/v1/chat/completions",
+                "api_key_env": "SLM_KEY_UAT_1",
+                "weight": 1,
+                "enabled": true,
+                "quota": { "rpm_limit": 240, "tpm_limit": 400000 }
+              },
+              {
+                "id": "uat-slm-2",
+                "url": "http://uat-slm-02.internal:8080/v1/chat/completions",
+                "api_key_env": "SLM_KEY_UAT_2",
+                "weight": 1,
+                "enabled": true,
+                "quota": { "rpm_limit": 240, "tpm_limit": 400000 }
+              }
+            ],
+            "fallback_models": []
+          }
+        }
+      },
+
+      "prod": {
+        "provider": "SmolDM2",
+        "quotas": {
+          "requests_per_minute": 500,
+          "requests_per_day": 200000,
+          "tokens_per_minute": 2000000
+        },
+        "models": {
+          "smoldm2-1.7b": {
+            "api_version": "v1",
+            "deployment": "smoldm2-1.7b",
+            "quotas": {
+              "requests_per_minute": 500,
+              "requests_per_day": 200000,
+              "tokens_per_minute": 2000000
+            },
+            "instances": [
+              {
+                "id": "prod-slm-1",
+                "url": "http://prod-slm-01.internal:8080/v1/chat/completions",
+                "api_key_env": "SLM_KEY_PROD_1",
+                "weight": 2,
+                "enabled": true,
+                "quota": { "rpm_limit": 600, "tpm_limit": 1000000 }
+              },
+              {
+                "id": "prod-slm-2",
+                "url": "http://prod-slm-02.internal:8080/v1/chat/completions",
+                "api_key_env": "SLM_KEY_PROD_2",
+                "weight": 2,
+                "enabled": true,
+                "quota": { "rpm_limit": 600, "tpm_limit": 1000000 }
+              },
+              {
+                "id": "prod-slm-3",
+                "url": "http://prod-slm-03.internal:8080/v1/chat/completions",
+                "api_key_env": "SLM_KEY_PROD_3",
+                "weight": 1,
+                "enabled": true,
+                "quota": { "rpm_limit": 300, "tpm_limit": 500000 }
+              }
+            ],
+            "fallback_models": []
+          }
+        }
+      }
+    }
+  },
+
+  "global_rate_limits": {
+    "enabled": true,
+    "per_subscription_key": {
+      "requests_per_minute": 60,
+      "burst": 10
+    },
+    "per_endpoint": {
+      "requests_per_minute": 500
+    },
+    "per_model": {
+      "requests_per_minute": 200
+    }
+  },
+
+  "subscription_quotas": {
+    "__comment": "Override global limits per subscription key prefix. Key = first 8 chars of sub key.",
+    "default": {
+      "tier": "standard",
+      "requests_per_minute": 60,
+      "requests_per_day": 5000,
+      "tokens_per_minute": 80000
+    },
+    "premium-": {
+      "tier": "premium",
+      "requests_per_minute": 200,
+      "requests_per_day": 50000,
+      "tokens_per_minute": 400000
+    },
+    "internal": {
+      "tier": "internal",
+      "requests_per_minute": 1000,
+      "requests_per_day": 999999,
+      "tokens_per_minute": 9999999
+    }
+  },
+
+  "retry_policy": {
+    "max_attempts": 3,
+    "backoff_base_seconds": 1.0,
+    "backoff_multiplier": 2.0,
+    "retry_on_status": [429, 500, 502, 503, 504],
+    "timeout_seconds": 60
+  },
+
+  "cache_policy": {
+    "enabled": true,
+    "ttl_seconds": 300,
+    "max_entries": 500,
+    "cache_on_methods": ["POST"],
+    "excluded_endpoints": []
+  },
+
+  "model_switching": {
+    "switch_on_status": [429, 503],
+    "switch_on_timeout": true
+  },
+
+  "apim_environments": {
+    "dev":  { "apim_url_hint": "dev-apim",  "environment": "dev"  },
+    "uat":  { "apim_url_hint": "uat-apim",  "environment": "uat"  },
+    "prod": { "apim_url_hint": "prod-apim", "environment": "prod" }
+  }
+}
