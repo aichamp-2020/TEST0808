@@ -1,1 +1,627 @@
+"""
+sf_entity_model.py
+==================
+Generates a complete entity model from a Salesforce org by:
+  1. Object scan    — lists all queryable sObjects via the REST metadata API
+  2. Field describe — calls /describe on each object to get fields, types,
+                      lookup relationships, picklist values
+  3. Data sampling  — runs SOQL LIMIT queries to compute null rates, cardinality,
+                      and actual value distributions (optional — works without it)
+  4. Model assembly — builds a structured entity model with all relationships
 
+Outputs
+-------
+  entities.json       — full entity model (objects + fields + stats)
+  relationships.json  — all lookup / master-detail relationships
+  entity_model.md     — Mermaid ERD for pasting into docs / GitHub
+  fields.csv          — flat field list for Excel / data catalog
+
+Install
+-------
+  pip install simple-salesforce
+
+Usage
+-----
+  # Basic — metadata scan only (fast, no record access)
+  python sf_entity_model.py \
+      --username you@org.com \
+      --password yourpassword \
+      --token yourSecurityToken
+
+  # With data sampling (queries up to SAMPLE_SIZE records per object)
+  python sf_entity_model.py \
+      --username you@org.com \
+      --password yourpassword \
+      --token yourSecurityToken \
+      --sample 200
+
+  # Filter to specific objects
+  python sf_entity_model.py ... --objects Account,Contact,Opportunity,Lead
+
+  # Include all custom objects only
+  python sf_entity_model.py ... --custom-only
+
+  # Connected app / OAuth (recommended for production)
+  python sf_entity_model.py \
+      --client-id your_connected_app_client_id \
+      --client-secret your_secret \
+      --username you@org.com \
+      --password yourpassword \
+      --token yourSecurityToken
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    from simple_salesforce import Salesforce, SalesforceLogin, SFType
+    from simple_salesforce.exceptions import SalesforceError
+except ImportError:
+    print("\nERROR: simple-salesforce not installed.")
+    print("  Run:  pip install simple-salesforce\n")
+    sys.exit(1)
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)-8s] %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger("sf_entity_model")
+
+# ─── Field type categories ────────────────────────────────────────────────────
+FIELD_TYPE_CATEGORY = {
+    "id":             "identity",
+    "reference":      "relationship",
+    "string":         "text",
+    "textarea":       "text",
+    "email":          "text",
+    "phone":          "text",
+    "url":            "text",
+    "picklist":       "categorical",
+    "multipicklist":  "categorical",
+    "boolean":        "flag",
+    "int":            "numeric",
+    "double":         "numeric",
+    "currency":       "numeric",
+    "percent":        "numeric",
+    "date":           "temporal",
+    "datetime":       "temporal",
+    "time":           "temporal",
+    "base64":         "binary",
+    "address":        "complex",
+    "location":       "complex",
+    "anyType":        "any",
+    "combobox":       "categorical",
+    "encryptedstring":"text",
+    "masterrecord":   "relationship",
+}
+
+
+# ─── Connection ───────────────────────────────────────────────────────────────
+def connect(args: argparse.Namespace) -> Salesforce:
+    """Connect to Salesforce using username/password or client credentials."""
+    kwargs: dict = {}
+
+    if args.domain:
+        kwargs["domain"] = args.domain
+
+    if args.client_id and args.client_secret:
+        log.info("Connecting via connected app (client credentials + user auth)")
+        sf = Salesforce(
+            username=args.username,
+            password=args.password,
+            security_token=args.token or "",
+            consumer_key=args.client_id,
+            consumer_secret=args.client_secret,
+            **kwargs,
+        )
+    else:
+        log.info("Connecting as %s", args.username)
+        sf = Salesforce(
+            username=args.username,
+            password=args.password,
+            security_token=args.token or "",
+            **kwargs,
+        )
+
+    log.info("Connected — org: %s  API version: %s",
+             sf.sf_instance, sf.sf_version)
+    return sf
+
+
+# ─── Object scan ─────────────────────────────────────────────────────────────
+def scan_objects(sf: Salesforce, args: argparse.Namespace) -> list[dict]:
+    """
+    Call /sobjects/ to get the full list of objects, then filter based on
+    --objects, --custom-only, and queryability.
+    """
+    log.info("Scanning available objects…")
+    result = sf.describe()
+    all_objects = result["sobjects"]
+    log.info("Total objects in org: %d", len(all_objects))
+
+    filtered = []
+    for obj in all_objects:
+        name = obj["name"]
+
+        # Skip non-queryable (e.g. history, share, tag objects)
+        if not obj.get("queryable", False):
+            continue
+
+        # --objects filter
+        if args.objects:
+            target = {o.strip() for o in args.objects.split(",")}
+            if name not in target:
+                continue
+
+        # --custom-only
+        if args.custom_only and not obj.get("custom", False):
+            continue
+
+        # Skip some internal SF objects unless explicitly requested
+        skip_prefixes = ("__", "AggregateResult", "VoiceCall")
+        if not args.objects and any(name.startswith(p) for p in skip_prefixes):
+            continue
+
+        filtered.append(obj)
+
+    log.info("Objects to process: %d", len(filtered))
+    return filtered
+
+
+# ─── Field describe ───────────────────────────────────────────────────────────
+def describe_object(sf: Salesforce, object_name: str) -> dict | None:
+    """Call /sobjects/{name}/describe/ and return structured field metadata."""
+    try:
+        sf_obj = getattr(sf, object_name)
+        desc = sf_obj.describe()
+    except Exception as exc:
+        log.warning("Could not describe %s: %s", object_name, exc)
+        return None
+
+    fields = []
+    relationships = []
+
+    for f in desc.get("fields", []):
+        fname      = f["name"]
+        ftype      = f["type"]
+        flabel     = f["label"]
+        fnullable  = f["nillable"]
+        flen       = f.get("length", 0)
+        fcustom    = f.get("custom", False)
+        funique    = f.get("unique", False)
+        fexternalid= f.get("externalId", False)
+        fcalc      = f.get("calculated", False)
+
+        # Picklist values
+        picklist_vals = []
+        if ftype in ("picklist", "multipicklist", "combobox"):
+            picklist_vals = [
+                pv["value"] for pv in f.get("picklistValues", [])
+                if pv.get("active", True)
+            ]
+
+        # Relationships (lookup / master-detail)
+        refs = f.get("referenceTo", [])
+        rel_name = f.get("relationshipName")
+        rel_type = None
+        if ftype == "reference":
+            rel_type = "master_detail" if not fnullable else "lookup"
+            for ref in refs:
+                relationships.append({
+                    "field":         fname,
+                    "field_label":   flabel,
+                    "type":          rel_type,
+                    "references":    ref,
+                    "relationship_name": rel_name,
+                    "nullable":      fnullable,
+                })
+
+        field_entry = {
+            "name":         fname,
+            "label":        flabel,
+            "type":         ftype,
+            "category":     FIELD_TYPE_CATEGORY.get(ftype, "other"),
+            "nullable":     fnullable,
+            "length":       flen,
+            "custom":       fcustom,
+            "unique":       funique,
+            "external_id":  fexternalid,
+            "calculated":   fcalc,
+            "picklist_values": picklist_vals,
+            "references_to": refs,
+            "relationship_name": rel_name,
+            # sampling fills these later
+            "null_rate":    None,
+            "distinct_count": None,
+            "sample_min":   None,
+            "sample_max":   None,
+        }
+        fields.append(field_entry)
+
+    # Child relationships (reverse lookup — what points TO this object)
+    child_rels = []
+    for cr in desc.get("childRelationships", []):
+        if cr.get("childSObject") and cr.get("field"):
+            child_rels.append({
+                "child_object":  cr["childSObject"],
+                "field":         cr["field"],
+                "relationship_name": cr.get("relationshipName"),
+                "cascade_delete": cr.get("cascadeDelete", False),
+            })
+
+    return {
+        "name":               object_name,
+        "label":              desc.get("label", object_name),
+        "label_plural":       desc.get("labelPlural", ""),
+        "custom":             desc.get("custom", False),
+        "queryable":          desc.get("queryable", True),
+        "createable":         desc.get("createable", False),
+        "updateable":         desc.get("updateable", False),
+        "deletable":          desc.get("deletable", False),
+        "fields":             fields,
+        "relationships":      relationships,
+        "child_relationships": child_rels,
+        "field_count":        len(fields),
+        "relationship_count": len(relationships),
+        "record_count":       None,   # filled by sampling
+        "sampled_records":    None,
+    }
+
+
+# ─── Data sampling ────────────────────────────────────────────────────────────
+def sample_object(sf: Salesforce, entity: dict, sample_size: int) -> None:
+    """
+    Run a SOQL query to sample records and compute:
+      - total record count (COUNT())
+      - null rate per field
+      - distinct value count per field
+      - min/max for numeric/date fields
+    Modifies entity in place.
+    """
+    name = entity["name"]
+    fields = entity["fields"]
+
+    # Get total count
+    try:
+        count_res = sf.query(f"SELECT COUNT() FROM {name}")
+        entity["record_count"] = count_res.get("totalSize", 0)
+    except Exception as exc:
+        log.warning("COUNT failed on %s: %s", name, exc)
+        entity["record_count"] = 0
+        entity["sampled_records"] = 0
+        return
+
+    if entity["record_count"] == 0:
+        entity["sampled_records"] = 0
+        return
+
+    # Build SOQL — only include queryable, non-complex fields
+    queryable_types = {
+        "id", "string", "textarea", "email", "phone", "url",
+        "picklist", "multipicklist", "boolean", "int", "double",
+        "currency", "percent", "date", "datetime", "reference",
+        "combobox",
+    }
+    field_names = [
+        f["name"] for f in fields
+        if f["type"] in queryable_types and not f.get("calculated")
+    ]
+
+    # Salesforce SOQL has a 100-field limit per query — chunk if needed
+    chunk_size = 80
+    all_records: list[dict] = []
+    for i in range(0, len(field_names), chunk_size):
+        chunk = field_names[i : i + chunk_size]
+        if "Id" not in chunk:
+            chunk = ["Id"] + chunk
+        soql = f"SELECT {', '.join(chunk)} FROM {name} LIMIT {sample_size}"
+        try:
+            res = sf.query(soql)
+            records = res.get("records", [])
+            if not all_records:
+                all_records = records
+            else:
+                # merge extra fields into existing records by index
+                for j, rec in enumerate(records):
+                    if j < len(all_records):
+                        all_records[j].update(rec)
+        except Exception as exc:
+            log.warning("Sample query failed on %s (chunk %d): %s", name, i, exc)
+            continue
+
+    n = len(all_records)
+    entity["sampled_records"] = n
+    if n == 0:
+        return
+
+    # Compute field-level stats
+    for f in fields:
+        fname = f["name"]
+        if fname not in field_names:
+            continue
+
+        values = [r.get(fname) for r in all_records]
+        non_null = [v for v in values if v is not None and v != ""]
+
+        f["null_rate"]    = round(1.0 - len(non_null) / n, 4) if n else None
+        f["distinct_count"] = len(set(str(v) for v in non_null)) if non_null else 0
+
+        # Min/max for numeric and date fields
+        if f["type"] in ("int", "double", "currency", "percent"):
+            nums = [v for v in non_null if isinstance(v, (int, float))]
+            if nums:
+                f["sample_min"] = min(nums)
+                f["sample_max"] = max(nums)
+
+        if f["type"] in ("date", "datetime"):
+            dates = sorted(str(v) for v in non_null if v)
+            if dates:
+                f["sample_min"] = dates[0]
+                f["sample_max"] = dates[-1]
+
+    log.info("  Sampled %s: %d records  (%d total)",
+             name, n, entity["record_count"])
+
+
+# ─── Relationship deduplication ───────────────────────────────────────────────
+def build_relationship_index(entities: list[dict]) -> list[dict]:
+    """
+    Collect all lookup/master-detail relationships across all entities
+    into a single deduplicated list.
+    """
+    seen = set()
+    rels = []
+    for e in entities:
+        for r in e.get("relationships", []):
+            key = (e["name"], r["field"], r["references"])
+            if key not in seen:
+                seen.add(key)
+                rels.append({
+                    "from_object":       e["name"],
+                    "from_field":        r["field"],
+                    "from_field_label":  r["field_label"],
+                    "to_object":         r["references"],
+                    "relationship_type": r["type"],
+                    "relationship_name": r.get("relationship_name"),
+                    "nullable":          r["nullable"],
+                })
+    return rels
+
+
+# ─── Mermaid ERD generation ───────────────────────────────────────────────────
+def generate_mermaid(entities: list[dict], relationships: list[dict]) -> str:
+    """
+    Generate a Mermaid erDiagram showing entities and their relationships.
+    Paste into GitHub markdown, Notion, or any Mermaid renderer.
+    """
+    lines = ["```mermaid", "erDiagram"]
+
+    entity_names = {e["name"] for e in entities}
+
+    for e in entities:
+        lines.append(f"  {e['name']} {{")
+        # Show key fields only (identity, relationship, unique, external_id)
+        key_fields = [
+            f for f in e["fields"]
+            if f["category"] in ("identity", "relationship")
+            or f.get("unique") or f.get("external_id")
+        ]
+        for f in key_fields[:12]:  # cap to keep ERD readable
+            ftype = f["type"].upper()
+            fname = f["name"]
+            label = ""
+            if f["category"] == "identity":
+                label = "PK"
+            elif f["category"] == "relationship":
+                label = "FK"
+            elif f.get("unique"):
+                label = "UK"
+            lines.append(f"    {ftype} {fname} {label}".rstrip())
+        lines.append("  }")
+
+    lines.append("")
+
+    # Relationships — only between objects in our entity set
+    for r in relationships:
+        if r["to_object"] not in entity_names:
+            continue
+        if r["relationship_type"] == "master_detail":
+            cardinality = "||--o{"
+        else:
+            cardinality = "}o--o|"
+        label = r.get("relationship_name") or r["from_field"]
+        lines.append(f'  {r["from_object"]} {cardinality} {r["to_object"]} : "{label}"')
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ─── CSV export ───────────────────────────────────────────────────────────────
+def export_csv(entities: list[dict], output_path: Path) -> None:
+    fieldnames = [
+        "object_name", "object_label", "object_custom",
+        "field_name", "field_label", "field_type", "field_category",
+        "nullable", "length", "custom", "unique", "external_id", "calculated",
+        "references_to", "null_rate", "distinct_count", "sample_min", "sample_max",
+        "picklist_count",
+    ]
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for e in entities:
+            for fld in e["fields"]:
+                writer.writerow({
+                    "object_name":   e["name"],
+                    "object_label":  e["label"],
+                    "object_custom": e["custom"],
+                    "field_name":    fld["name"],
+                    "field_label":   fld["label"],
+                    "field_type":    fld["type"],
+                    "field_category":fld["category"],
+                    "nullable":      fld["nullable"],
+                    "length":        fld["length"],
+                    "custom":        fld["custom"],
+                    "unique":        fld["unique"],
+                    "external_id":   fld["external_id"],
+                    "calculated":    fld["calculated"],
+                    "references_to": ",".join(fld["references_to"]),
+                    "null_rate":     fld["null_rate"],
+                    "distinct_count":fld["distinct_count"],
+                    "sample_min":    fld["sample_min"],
+                    "sample_max":    fld["sample_max"],
+                    "picklist_count":len(fld["picklist_values"]),
+                })
+
+
+# ─── Summary stats ────────────────────────────────────────────────────────────
+def print_summary(entities: list[dict], relationships: list[dict]) -> None:
+    total_fields    = sum(e["field_count"] for e in entities)
+    total_custom    = sum(sum(1 for f in e["fields"] if f["custom"]) for e in entities)
+    total_rels      = len(relationships)
+    master_detail   = sum(1 for r in relationships if r["relationship_type"] == "master_detail")
+    lookup          = sum(1 for r in relationships if r["relationship_type"] == "lookup")
+
+    print("\n" + "=" * 60)
+    print("  SALESFORCE ENTITY MODEL SUMMARY")
+    print("=" * 60)
+    print(f"  Objects scanned       : {len(entities)}")
+    print(f"  Total fields          : {total_fields}")
+    print(f"  Custom fields         : {total_custom}")
+    print(f"  Relationships         : {total_rels}")
+    print(f"    Master-detail       : {master_detail}")
+    print(f"    Lookup              : {lookup}")
+    print()
+    print("  Top objects by field count:")
+    for e in sorted(entities, key=lambda x: x["field_count"], reverse=True)[:10]:
+        rc = f"  ({e['record_count']:,} records)" if e["record_count"] else ""
+        print(f"    {e['name']:<35} {e['field_count']:>4} fields{rc}")
+    print("=" * 60)
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate a Salesforce entity model via object scan + data sampling",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Metadata scan only (fast)
+  python sf_entity_model.py --username me@org.com --password pass --token TOKEN
+
+  # With 200-record sampling per object
+  python sf_entity_model.py --username me@org.com --password pass --token TOKEN --sample 200
+
+  # Specific objects only
+  python sf_entity_model.py --username me@org.com --password pass --token TOKEN \\
+      --objects Account,Contact,Opportunity,Case,Lead
+
+  # Custom objects only + sampling
+  python sf_entity_model.py --username me@org.com --password pass --token TOKEN \\
+      --custom-only --sample 100
+
+  # Sandbox
+  python sf_entity_model.py --username me@sandbox.com --password pass --token TOKEN \\
+      --domain test
+        """
+    )
+    parser.add_argument("--username",      required=True,  help="Salesforce username")
+    parser.add_argument("--password",      required=True,  help="Salesforce password")
+    parser.add_argument("--token",         default="",     help="Salesforce security token")
+    parser.add_argument("--client-id",     default="",     help="Connected app consumer key")
+    parser.add_argument("--client-secret", default="",     help="Connected app consumer secret")
+    parser.add_argument("--domain",        default="login",help="login (prod) or test (sandbox)")
+    parser.add_argument("--objects",       default="",     help="Comma-separated object names to include")
+    parser.add_argument("--custom-only",   action="store_true", help="Only include custom objects (__c)")
+    parser.add_argument("--sample",        type=int, default=0,
+                        help="Records to sample per object for null rate / cardinality (0 = skip)")
+    parser.add_argument("--output-dir",    default="sf_entity_model",
+                        help="Output directory (default: sf_entity_model/)")
+    parser.add_argument("--concurrency",   type=int, default=1,
+                        help="Parallel describe threads (default: 1, max: 5)")
+    args = parser.parse_args()
+
+    # ── Connect ───────────────────────────────────────────────────────────────
+    sf = connect(args)
+
+    # ── Object scan ───────────────────────────────────────────────────────────
+    objects_meta = scan_objects(sf, args)
+    if not objects_meta:
+        log.error("No objects matched your filters. Check --objects or --custom-only.")
+        sys.exit(1)
+
+    # ── Describe each object ──────────────────────────────────────────────────
+    entities: list[dict] = []
+    total = len(objects_meta)
+    for i, obj_meta in enumerate(objects_meta, 1):
+        name = obj_meta["name"]
+        log.info("[%d/%d] Describing %s", i, total, name)
+        entity = describe_object(sf, name)
+        if entity:
+            entities.append(entity)
+        time.sleep(0.05)  # gentle rate limiting
+
+    # ── Data sampling (optional) ──────────────────────────────────────────────
+    if args.sample > 0:
+        log.info("Sampling up to %d records per object…", args.sample)
+        for i, entity in enumerate(entities, 1):
+            log.info("[%d/%d] Sampling %s", i, len(entities), entity["name"])
+            sample_object(sf, entity, args.sample)
+            time.sleep(0.1)
+
+    # ── Build relationship index ──────────────────────────────────────────────
+    relationships = build_relationship_index(entities)
+
+    # ── Outputs ───────────────────────────────────────────────────────────────
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # entities.json
+    entities_path = out / "entities.json"
+    with entities_path.open("w", encoding="utf-8") as f:
+        json.dump(entities, f, indent=2, default=str)
+    log.info("Saved: %s", entities_path)
+
+    # relationships.json
+    rels_path = out / "relationships.json"
+    with rels_path.open("w", encoding="utf-8") as f:
+        json.dump(relationships, f, indent=2)
+    log.info("Saved: %s", rels_path)
+
+    # Mermaid ERD
+    mermaid_path = out / "entity_model.md"
+    mermaid_src = generate_mermaid(entities, relationships)
+    with mermaid_path.open("w", encoding="utf-8") as f:
+        f.write(f"# Salesforce Entity Model\n\n")
+        f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
+        f.write(mermaid_src)
+    log.info("Saved: %s", mermaid_path)
+
+    # CSV field list
+    csv_path = out / "fields.csv"
+    export_csv(entities, csv_path)
+    log.info("Saved: %s", csv_path)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print_summary(entities, relationships)
+
+    print(f"\n  Output files in:  {out.resolve()}/")
+    print(f"    entities.json      — full entity model")
+    print(f"    relationships.json — all object relationships")
+    print(f"    entity_model.md    — Mermaid ERD (paste into GitHub / Notion)")
+    print(f"    fields.csv         — field catalog for Excel / data tools")
+
+
+if __name__ == "__main__":
+    main()
