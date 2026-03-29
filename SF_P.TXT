@@ -1,1 +1,929 @@
+"""
+sf_pii_discovery.py
+====================
+Scans a Salesforce org for PII-bearing fields across ALL user/business objects,
+automatically excluding every Salesforce system object (setup, audit, config,
+metadata, tooling, etc.) from the scan.
 
+Pipeline
+--------
+  1. Connect        — simple_salesforce OAuth / username-password
+  2. Object scan    — list all sObjects, strip system objects using a
+                      four-layer exclusion filter:
+                        a) exact name blocklist (400+ known SF system objects)
+                        b) suffix patterns  (__History, __Share, __Feed, ...)
+                        c) prefix patterns  (Setup, Auth, OauthCustom, ...)
+                        d) object-property flags (queryable, layoutable, etc.)
+  3. Field scan     — describe() each surviving object → classify every field
+                      for PII risk using regex + type + label heuristics
+  4. Data sampling  — SOQL LIMIT queries → compute null rate, sample values,
+                      confirm PII presence with regex matching on real data
+  5. Report         — pii_report.json, pii_summary.csv, pii_remediation.md
+
+PII categories detected
+-----------------------
+  DIRECT_IDENTIFIER   — Name, email, phone, SSN, passport, national ID
+  QUASI_IDENTIFIER    — DOB, ZIP, gender, race, age
+  FINANCIAL           — credit card, bank account, routing, salary
+  HEALTH              — diagnosis, medication, conditions, medical record
+  CREDENTIALS         — password, API key, token, secret
+  LOCATION            — address, coordinates, IP address
+  BIOMETRIC           — fingerprint, face, voice
+  BEHAVIORAL          — browsing, purchase history (field name heuristics)
+  FREE_TEXT           — large text/memo fields that may contain any of the above
+
+Install
+-------
+  pip install simple-salesforce
+
+Usage
+-----
+  # Full scan — all non-system objects, no sampling
+  python sf_pii_discovery.py \\
+      --username you@org.com --password pass --token TOKEN
+
+  # With 200-record data sampling (validates PII with real values)
+  python sf_pii_discovery.py \\
+      --username you@org.com --password pass --token TOKEN --sample 200
+
+  # Sandbox
+  python sf_pii_discovery.py \\
+      --username you@sandbox.com --password pass --token TOKEN --domain test
+
+  # Only custom objects
+  python sf_pii_discovery.py ... --custom-only
+
+  # Specific objects + sampling
+  python sf_pii_discovery.py ... --objects Account,Contact,Lead --sample 100
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    from simple_salesforce import Salesforce
+except ImportError:
+    print("\nERROR: simple-salesforce not installed.\n  Run: pip install simple-salesforce\n")
+    sys.exit(1)
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)-8s] %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger("sf_pii")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SYSTEM OBJECT EXCLUSION  —  four-layer filter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Layer A — exact name blocklist: every known Salesforce system/internal object.
+# Covers setup, security, metadata, tooling, Einstein, CPQ, Service, Marketing,
+# Communities, Process Automation, Change Tracking, reporting, and more.
+SF_SYSTEM_OBJECTS_EXACT: frozenset[str] = frozenset({
+    # ── Core system / identity ────────────────────────────────────────────────
+    "User", "UserRole", "UserPreference", "UserLogin", "UserAppInfo",
+    "UserAppMenuCustomization", "UserAppMenuCustomizationShare",
+    "UserBooleanSetting", "UserEntityAccess", "UserFieldAccess",
+    "UserLicense", "UserPackageLicense", "UserPermissionAccess",
+    "UserProvAccount", "UserProvAccountStaging", "UserProvMockTarget",
+    "UserProvisioningConfig", "UserProvisioningLog", "UserProvisioningRequest",
+    "UserProvisioningRequestShare", "UserRecordAccess", "UserShare",
+    "UserTeamMember", "Profile", "PermissionSet", "PermissionSetAssignment",
+    "PermissionSetGroup", "PermissionSetGroupComponent", "PermissionSetLicense",
+    "PermissionSetLicenseAssign", "PermissionSetTabSetting",
+    "ObjectPermissions", "FieldPermissions", "SetupEntityAccess",
+    "ApexClass", "ApexComponent", "ApexEmailNotification", "ApexLog",
+    "ApexPage", "ApexTestQueueItem", "ApexTestResult", "ApexTestResultLimits",
+    "ApexTestRunResult", "ApexTestSuite", "ApexTrigger", "ApexTriggerCoupling",
+    # ── Authentication / OAuth / Security ─────────────────────────────────────
+    "AuthConfig", "AuthConfigProviders", "AuthProvider", "AuthSession",
+    "ConnectedApplication", "OauthToken", "OauthCustomScope",
+    "OauthCustomScopeApp", "OauthCustomScopeUser", "OauthTokenIntrospection",
+    "SamlSsoConfig", "DelegatedAccount", "CertificateAuthority",
+    "Certificate", "MutualAuthConfig", "MutualAuthCertificate",
+    "ExternalDataSource", "ExternalDataUserAuth", "NamedCredential",
+    "NamedCredentialParameter", "OrgWideEmailAddress",
+    # ── Org / Setup / Config ──────────────────────────────────────────────────
+    "Organization", "BusinessHours", "BusHours", "BusinessProcess",
+    "CompanyAuthorization", "Currency", "CurrencyType", "DatedConversionRate",
+    "FiscalYearSettings", "Holiday", "Language", "Locale", "RecordType",
+    "WebLink", "FieldSet", "Layout", "ListView", "ListViewChart",
+    "ListViewChartInstance", "NetworkMember", "NetworkMemberGroup",
+    "NetworkPageOverride", "NetworkSelfRegistration", "NetworkTabSet",
+    "Network", "NetworkActivityAudit",
+    "Domain", "DomainSite", "SiteDotCom", "Site",
+    "CustomPermission", "CustomPermissionDependency",
+    "CustomBrand", "CustomBrandAsset",
+    "GroupMember", "Group", "Queue", "QueueSobject",
+    "Territory", "Territory2", "Territory2Model", "Territory2Rule",
+    "Territory2RuleItem", "Territory2Type", "UserTerritory",
+    "UserTerritory2Association", "ObjectTerritory2Association",
+    # ── Metadata / Tooling ─────────────────────────────────────────────────────
+    "CustomObject", "CustomField", "CustomObjectDefinition",
+    "CustomLabel", "CustomObjectTranslation", "CustomSite",
+    "CustomHelpMenuSection", "CustomHelpMenuItem",
+    "AuraDefinition", "AuraDefinitionBundle", "AuraDefinitionBundleInfo",
+    "LightningComponentBundle", "LightningExperienceTheme",
+    "LightningOnboardingConfig", "LightningToggleMetrics",
+    "LightningUsageByAppTypeMetrics", "LightningUsageByBrowserMetrics",
+    "LightningUsageByPageMetrics", "LightningUsageByFlexiPageMetrics",
+    "StaticResource",
+    "ContentDocumentLink", "ContentDocument", "ContentVersion",
+    "ContentVersionHistory", "ContentNote", "ContentBody",
+    "ContentDistribution", "ContentDistributionView", "ContentWorkspace",
+    "ContentWorkspaceMember", "ContentWorkspacePermission", "ContentWorkspaceDoc",
+    "ContentHubItem", "ContentHubRepository",
+    "Document", "DocumentAttachmentMap",
+    "Attachment", "Note",
+    # ── Audit / Change tracking / History ─────────────────────────────────────
+    "SetupAuditTrail", "LoginHistory", "LoginGeo", "LoginIp",
+    "LoginEvent", "LogoutEvent", "ReportEvent", "ListViewEvent",
+    "ApiEvent", "BulkApiResultEventStore", "ReportAnomaly",
+    "IdentityVerificationEvent", "CredentialStuffingEventStore",
+    "SessionHijackingEventStore", "PermissionSetEventStore",
+    "ApiAnomalyEventStore", "ConcurLongRunApexErrEvent",
+    "TransactionSecurityPolicy",
+    # ── Workflow / Process / Flow / Approval ──────────────────────────────────
+    "WorkflowRule", "WorkflowAction", "WorkflowFieldUpdate",
+    "WorkflowOutboundMessage", "WorkflowTask", "WorkflowAlert",
+    "WorkflowTimeTrigger", "WorkflowActionWrapper",
+    "FlowDefinition", "FlowInterview", "FlowInterviewLog",
+    "FlowInterviewLogEntry", "FlowStageRelation", "FlowRecordRelation",
+    "FlowExecutionErrorEvent",
+    "ProcessInstance", "ProcessInstanceHistory", "ProcessInstanceNode",
+    "ProcessInstanceStep", "ProcessInstanceWorkitem",
+    "Approval", "ApprovalStep",
+    "ActionDefinition", "ActionPlanItem", "ActionPlanTemplate",
+    "ActionPlanTemplateItem", "ActionPlanTemplateItemValue",
+    # ── Reports / Dashboards ──────────────────────────────────────────────────
+    "Report", "ReportFeed", "ReportTag",
+    "Dashboard", "DashboardFeed", "DashboardTag", "DashboardComponent",
+    "DashboardComponentFeed", "Folder", "FolderShare",
+    # ── Email / Notification / Messaging ─────────────────────────────────────
+    "EmailMessage", "EmailMessageRelation",
+    "EmailServicesAddress", "EmailServicesFunction",
+    "EmailTemplate", "BrandTemplate",
+    "MessagingChannel", "MessagingChannelSkill",
+    "MessagingEndUser", "MessagingSession",
+    "QuickText", "QuickTextUsage",
+    "Announcement", "CollaborationInvitation",
+    "ChatterMessage", "ChatterActivity",
+    # ── Feed / Chatter / Social ───────────────────────────────────────────────
+    "FeedComment", "FeedItem", "FeedLike", "FeedPost",
+    "FeedRevision", "FeedSignal", "FeedTrackedChange",
+    "FeedPollChoice", "FeedPollVote",
+    "TopicAssignment", "Topic", "TopicFeed", "TopicUserEvent",
+    "HashtagDefinition",
+    "CollaborationGroup", "CollaborationGroupFeed",
+    "CollaborationGroupMember", "CollaborationGroupMemberRequest",
+    "CollaborationGroupRecord",
+    # ── Data export / bulk / jobs ─────────────────────────────────────────────
+    "AsyncApexJob", "BatchApexErrorEvent", "CronJobDetail", "CronTrigger",
+    "BulkApiResultEventStore",
+    "BackgroundOperation", "BackgroundOperationResult",
+    "DataAssessmentFieldMetric", "DataAssessmentMetric",
+    "DataAssessmentObjectMetric",
+    "DatacloudAddress", "DatacloudCompany", "DatacloudContact",
+    "DatacloudDandBCompany", "DatacloudOwnedEntity", "DatacloudPurchaseUsage",
+    # ── Communities / Experience Cloud ────────────────────────────────────────
+    "Community", "CommunityFeedback", "CommunityPage",
+    "CommunityRelatedRecord", "CommunityScm", "CommunitiesSettings",
+    "NetworkSelfRegistration", "NetworkPageOverride", "NetworkTabSet",
+    # ── Einstein / AI ────────────────────────────────────────────────────────
+    "AIApplication", "AIApplicationConfig", "AIInsightAction",
+    "AIInsightFeedback", "AIInsightReason", "AIInsightValue",
+    "AIRecordInsight", "AIReplyRecommendationsSettings",
+    "MLPredictionDefinition", "MLField", "MLDataDefinition",
+    # ── Commerce / CPQ / Billing ─────────────────────────────────────────────
+    "SBQQ__Assumption__c", "SBQQ__BlockPrice__c", "SBQQ__Column__c",
+    "WebStore", "WebStoreCatalog", "WebStorePricebook", "WebStoreBuyerGroup",
+    "ProductCatalog", "ProductCategory", "ProductCategoryProduct",
+    # ── Field Service Lightning ────────────────────────────────────────────────
+    "FSL__Scheduling_Policy__c", "FSL__Time_Slot__c",
+    # ── Knowledge ────────────────────────────────────────────────────────────
+    "KnowledgeArticle", "KnowledgeArticleVersion", "KnowledgeArticleVersionHistory",
+    "KnowledgeArticleViewStat", "KnowledgeArticleVoteStat",
+    # ── Translation / Localization ────────────────────────────────────────────
+    "Translation",
+    # ── Package / ISV ────────────────────────────────────────────────────────
+    "PackageLicense", "InstalledPackage",
+    # ── Misc internal ─────────────────────────────────────────────────────────
+    "AggregateResult", "EntityDefinition", "EntityParticle",
+    "FieldDefinition", "RelationshipInfo", "RelationshipDomain",
+    "SearchLayout", "SearchCustomization",
+    "Publisher", "ColorDefinition", "IconDefinition",
+    "RecordTypeLocalization", "PicklistValueInfo", "StandardValueSet",
+    "StandardValueSetTranslation", "GlobalValueSet", "GlobalValueSetTranslation",
+    "SObjectType",
+})
+
+# Layer B — suffix patterns: SF auto-generates these for every custom object
+SF_SYSTEM_SUFFIXES: tuple[str, ...] = (
+    "__History",      # field history tracking
+    "__Share",        # sharing rules/rows
+    "__Feed",         # Chatter feed per object
+    "__Tag",          # tagging
+    "__ChangeEvent",  # change data capture
+    "__mdt",          # custom metadata types
+    "ChangeEvent",    # standard CDC objects
+    "History",        # standard history tables (AccountHistory, etc.)
+    "Share",          # standard share tables  (AccountShare, etc.)
+    "Feed",           # standard feed tables   (AccountFeed, etc.)
+    "Tag",            # standard tag tables    (AccountTag, etc.)
+)
+
+# Layer C — prefix patterns: internal/platform namespaces
+SF_SYSTEM_PREFIXES: tuple[str, ...] = (
+    "Setup",          # SetupAuditTrail, SetupEntityAccess etc.
+    "Auth",           # AuthConfig, AuthSession etc.
+    "Oauth",          # OauthToken etc.
+    "Tooling",        # Tooling API objects
+    "MetadataPackage",
+    "PackageInstall",
+    "Aura",           # Aura component metadata
+    "Lightning",      # Lightning usage metrics
+    "Wave",           # Analytics / Tableau CRM
+    "Insight",        # Einstein insights
+    "Pardot",         # Pardot marketing
+    "pi__",           # Pardot namespace
+    "et4ae5__",       # Marketing Cloud namespace
+    "mceb__",         # Marketing Cloud
+    "LiveChat",       # Live Agent
+    "Snap",           # Snap-ins (chat)
+    "PendingService", # Service internally
+    "Collaboration",  # some Chatter objects
+    "Idea",           # Ideas (communities)
+    "Solution",       # legacy Solutions
+)
+
+# Layer D — flag-based: objects SF marks as not intended for user queries
+SF_SYSTEM_FLAGS_EXCLUDE = {
+    "layoutable": False,    # system objects rarely have layouts
+}
+
+
+def is_system_object(obj_meta: dict) -> tuple[bool, str]:
+    """
+    Return (True, reason) if the object should be excluded as a system object,
+    (False, "") if it should be included in PII scanning.
+    """
+    name   = obj_meta.get("name", "")
+    label  = obj_meta.get("label", "")
+    custom = obj_meta.get("custom", False)
+
+    # Layer A — exact blocklist
+    if name in SF_SYSTEM_OBJECTS_EXACT:
+        return True, f"exact_blocklist"
+
+    # Layer B — suffix patterns
+    for suffix in SF_SYSTEM_SUFFIXES:
+        if name.endswith(suffix):
+            return True, f"system_suffix:{suffix}"
+
+    # Layer C — prefix patterns (only for standard objects; custom objects have business meaning)
+    if not custom:
+        for prefix in SF_SYSTEM_PREFIXES:
+            if name.startswith(prefix):
+                return True, f"system_prefix:{prefix}"
+
+    # Layer D — not queryable → cannot scan
+    if not obj_meta.get("queryable", False):
+        return True, "not_queryable"
+
+    # Layer D — deprecatedAndHidden
+    if obj_meta.get("deprecatedAndHidden", False):
+        return True, "deprecated_hidden"
+
+    # Metadata types (always end in __mdt) — excluded above by suffix but guard again
+    if name.endswith("__mdt"):
+        return True, "custom_metadata_type"
+
+    # Platform event objects (end in __e)
+    if name.endswith("__e"):
+        return True, "platform_event"
+
+    # External objects (end in __x)
+    if name.endswith("__x"):
+        return True, "external_object"
+
+    return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PII DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PII_CATEGORY = {
+    "DIRECT_IDENTIFIER": "High",
+    "QUASI_IDENTIFIER":  "Medium",
+    "FINANCIAL":         "High",
+    "HEALTH":            "High",
+    "CREDENTIALS":       "Critical",
+    "LOCATION":          "Medium",
+    "BIOMETRIC":         "High",
+    "BEHAVIORAL":        "Low",
+    "FREE_TEXT":         "Medium",
+}
+
+# (category, compiled_regex_on_field_name_lowercase)
+PII_FIELD_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # ── Critical: credentials ─────────────────────────────────────────────────
+    ("CREDENTIALS", re.compile(
+        r"password|passwd|secret|api.?key|auth.?token|access.?token|"
+        r"refresh.?token|private.?key|encryption.?key|credential", re.I)),
+
+    # ── Direct identifiers ────────────────────────────────────────────────────
+    ("DIRECT_IDENTIFIER", re.compile(
+        r"\bssn\b|social.?security|national.?id|passport|"
+        r"driver.?licen[sc]e|license.?number|"
+        r"tax.?id|tin\b|ein\b|national.?insurance|"
+        r"first.?name|last.?name|full.?name|given.?name|"
+        r"surname|middle.?name|maiden.?name|"
+        r"birth.?name|legal.?name", re.I)),
+
+    # ── Contact / communication ───────────────────────────────────────────────
+    ("DIRECT_IDENTIFIER", re.compile(
+        r"\bemail\b|e.?mail|"
+        r"\bphone\b|\bmobile\b|\bcell\b|fax|"
+        r"home.?number|work.?number|contact.?number", re.I)),
+
+    # ── Quasi-identifiers ────────────────────────────────────────────────────
+    ("QUASI_IDENTIFIER", re.compile(
+        r"birth.?date|date.?of.?birth|dob\b|age\b|"
+        r"gender\b|sex\b|ethnicity|race\b|"
+        r"zip.?code|postal.?code|postcode|"
+        r"marital.?status|religion|nationality|citizenship|"
+        r"language\b|occupation\b", re.I)),
+
+    # ── Location / address ────────────────────────────────────────────────────
+    ("LOCATION", re.compile(
+        r"\baddress\b|\bstreet\b|\bcity\b|\bstate\b|"
+        r"country\b|region\b|province\b|"
+        r"latitude|longitude|geo.?location|coordinates|"
+        r"\bip.?address\b|\bip\b|gps", re.I)),
+
+    # ── Financial ────────────────────────────────────────────────────────────
+    ("FINANCIAL", re.compile(
+        r"credit.?card|card.?number|card.?num|cvv\b|cvc\b|"
+        r"bank.?account|account.?number|acct.?num|routing.?number|"
+        r"iban\b|swift\b|bic\b|"
+        r"\bsalary\b|\bwage\b|\bincome\b|compensation|"
+        r"tax.?return|financial|payment.?info", re.I)),
+
+    # ── Health / medical ────────────────────────────────────────────────────
+    ("HEALTH", re.compile(
+        r"diagnosis|medical.?record|health.?condition|"
+        r"medication|prescription|allergy|allergies|"
+        r"npi\b|medical.?id|patient.?id|"
+        r"disability|chronic|treatment|clinical|"
+        r"insurance.?id|member.?id|policy.?number", re.I)),
+
+    # ── Biometric ─────────────────────────────────────────────────────────────
+    ("BIOMETRIC", re.compile(
+        r"fingerprint|facial|face.?id|voice.?print|"
+        r"iris.?scan|retina|biometric|dna\b", re.I)),
+
+    # ── Behavioral ───────────────────────────────────────────────────────────
+    ("BEHAVIORAL", re.compile(
+        r"browsing.?history|purchase.?history|clickstream|"
+        r"search.?history|activity.?log|behavior", re.I)),
+]
+
+# Field types that could contain PII even without matching name patterns
+PII_RISKY_TYPES = {"textarea", "richtext", "string", "email", "phone", "url"}
+
+# Fields that are definitely NOT PII regardless of name
+SAFE_FIELD_NAMES: frozenset[str] = frozenset({
+    "Id", "IsDeleted", "CreatedById", "CreatedDate",
+    "LastModifiedById", "LastModifiedDate", "SystemModstamp",
+    "LastActivityDate", "LastViewedDate", "LastReferencedDate",
+    "RecordTypeId", "OwnerId", "CurrencyIsoCode", "MasterRecordId",
+})
+
+# Regex to scan actual sampled values for PII patterns
+VALUE_REGEX: dict[str, re.Pattern] = {
+    "email":   re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
+    "ssn":     re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b"),
+    "phone":   re.compile(r"(\+?1[-.\s]?)?(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"),
+    "card":    re.compile(r"\b(?:\d[ -]?){13,16}\b"),
+    "ip":      re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "nhs":     re.compile(r"\b\d{3}[-\s]\d{3}[-\s]\d{4}\b"),
+}
+
+
+def classify_field_pii(field: dict) -> dict | None:
+    """
+    Analyse a field's name, label, and type for PII risk.
+    Returns a finding dict or None if no PII detected.
+    """
+    fname  = field["name"]
+    flabel = field.get("label", "")
+    ftype  = field.get("type", "")
+
+    if fname in SAFE_FIELD_NAMES:
+        return None
+
+    search_text = f"{fname} {flabel}".lower()
+
+    matched_category = None
+    matched_pattern  = None
+
+    for category, pattern in PII_FIELD_PATTERNS:
+        if pattern.search(search_text):
+            matched_category = category
+            matched_pattern  = pattern.pattern
+            break
+
+    # Large text fields are always flagged as potential FREE_TEXT PII
+    if not matched_category and ftype in ("textarea", "richtext"):
+        matched_category = "FREE_TEXT"
+        matched_pattern  = "large_text_field"
+
+    if not matched_category:
+        return None
+
+    return {
+        "field_name":     fname,
+        "field_label":    flabel,
+        "field_type":     ftype,
+        "pii_category":   matched_category,
+        "risk_level":     PII_CATEGORY[matched_category],
+        "matched_rule":   matched_pattern,
+        "nullable":       field.get("nullable", True),
+        "custom":         field.get("custom", False),
+        "null_rate":      field.get("null_rate"),
+        "distinct_count": field.get("distinct_count"),
+        "sample_values":  [],     # populated during sampling
+        "confirmed_pii":  None,   # True/False after sampling
+    }
+
+
+def scan_values_for_pii(values: list[str], finding: dict) -> None:
+    """Run regex against sampled values to confirm PII presence."""
+    hits = {}
+    for pattern_name, rx in VALUE_REGEX.items():
+        matches = [v for v in values if v and rx.search(str(v))]
+        if matches:
+            hits[pattern_name] = matches[:3]  # keep up to 3 examples
+
+    finding["confirmed_pii"] = bool(hits)
+    finding["value_matches"]  = hits
+    # Store a few masked sample values for evidence
+    masked = []
+    for v in values[:5]:
+        if v:
+            s = str(v)
+            masked.append(s[:4] + "****" + s[-2:] if len(s) > 6 else "****")
+    finding["sample_values"] = masked
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONNECT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def connect(args: argparse.Namespace) -> Salesforce:
+    log.info("Connecting to Salesforce as %s …", args.username)
+    kwargs = {"domain": args.domain} if args.domain else {}
+    sf = Salesforce(
+        username=args.username,
+        password=args.password,
+        security_token=args.token or "",
+        consumer_key=args.client_id or None,
+        consumer_secret=args.client_secret or None,
+        **kwargs,
+    )
+    log.info("Connected — instance: %s  API: %s", sf.sf_instance, sf.sf_version)
+    return sf
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OBJECT SCAN  (with system object exclusion)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def scan_objects(sf: Salesforce, args: argparse.Namespace) -> tuple[list[dict], list[dict]]:
+    """
+    Returns (included_objects, excluded_objects).
+    excluded_objects logged for audit trail.
+    """
+    log.info("Fetching object list from Salesforce…")
+    all_objects = sf.describe()["sobjects"]
+    log.info("Total objects in org: %d", len(all_objects))
+
+    included, excluded = [], []
+
+    for obj in all_objects:
+        name = obj["name"]
+
+        # Explicit --objects filter
+        if args.objects:
+            target = {o.strip() for o in args.objects.split(",")}
+            if name not in target:
+                continue
+
+        # --custom-only
+        if args.custom_only and not obj.get("custom", False):
+            excluded.append({**obj, "_exclusion_reason": "not_custom"})
+            continue
+
+        # System object filter — four-layer check
+        is_sys, reason = is_system_object(obj)
+        if is_sys:
+            excluded.append({**obj, "_exclusion_reason": reason})
+            continue
+
+        included.append(obj)
+
+    log.info("Objects included in PII scan : %d", len(included))
+    log.info("Objects excluded (system)    : %d", len(excluded))
+    return included, excluded
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DESCRIBE + PII CLASSIFY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def describe_and_classify(sf: Salesforce, obj_meta: dict) -> dict | None:
+    """Describe one object and classify all its fields for PII."""
+    name = obj_meta["name"]
+    try:
+        desc = getattr(sf, name).describe()
+    except Exception as exc:
+        log.warning("describe() failed on %s: %s", name, exc)
+        return None
+
+    fields        = desc.get("fields", [])
+    pii_findings  = []
+    all_fields    = []
+
+    for f in fields:
+        finding = classify_field_pii(f)
+        field_entry = {
+            "name":     f["name"],
+            "label":    f.get("label", ""),
+            "type":     f.get("type", ""),
+            "nullable": f.get("nillable", True),
+            "custom":   f.get("custom", False),
+            "null_rate": None,
+            "distinct_count": None,
+        }
+        all_fields.append(field_entry)
+        if finding:
+            pii_findings.append(finding)
+
+    return {
+        "name":         name,
+        "label":        desc.get("label", name),
+        "label_plural": desc.get("labelPlural", ""),
+        "custom":       desc.get("custom", False),
+        "field_count":  len(fields),
+        "pii_count":    len(pii_findings),
+        "all_fields":   all_fields,
+        "pii_fields":   pii_findings,
+        "record_count": None,
+        "sampled":      False,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATA SAMPLING  (confirms PII with real values)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sample_object_pii(sf: Salesforce, entity: dict, sample_size: int) -> None:
+    """Sample records and validate PII findings against real values."""
+    name = entity["name"]
+
+    # Get count
+    try:
+        ct = sf.query(f"SELECT COUNT() FROM {name}")
+        entity["record_count"] = ct.get("totalSize", 0)
+    except Exception as exc:
+        log.warning("COUNT failed on %s: %s", name, exc)
+        return
+
+    if entity["record_count"] == 0:
+        entity["sampled"] = True
+        return
+
+    # Only sample fields that have a PII finding
+    pii_field_names = [f["field_name"] for f in entity["pii_fields"]]
+    if not pii_field_names:
+        entity["sampled"] = True
+        return
+
+    # Chunk to stay under SOQL 100-field limit
+    chunk_size = 50
+    all_records: list[dict] = []
+    for i in range(0, len(pii_field_names), chunk_size):
+        chunk = ["Id"] + pii_field_names[i : i + chunk_size]
+        soql  = f"SELECT {', '.join(chunk)} FROM {name} LIMIT {sample_size}"
+        try:
+            res = sf.query(soql)
+            records = res.get("records", [])
+            if not all_records:
+                all_records = records
+            else:
+                for j, rec in enumerate(records):
+                    if j < len(all_records):
+                        all_records[j].update(rec)
+        except Exception as exc:
+            log.warning("Sample query failed on %s (chunk %d): %s", name, i, exc)
+
+    n = len(all_records)
+    entity["sampled"] = True
+
+    for finding in entity["pii_fields"]:
+        fname  = finding["field_name"]
+        values = [str(r.get(fname, "")) for r in all_records if r.get(fname)]
+        non_null = [v for v in values if v]
+
+        finding["null_rate"]    = round(1 - len(non_null) / n, 3) if n else None
+        finding["distinct_count"] = len(set(non_null)) if non_null else 0
+
+        # Search for PII patterns in actual values
+        scan_values_for_pii(non_null, finding)
+
+    log.info("  Sampled %s — %d records, %d PII fields", name, n, len(entity["pii_fields"]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REPORTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_remediation_md(entities: list[dict], excluded_count: int) -> str:
+    """Generate a markdown remediation report."""
+    lines = [
+        "# Salesforce PII Discovery Report",
+        "",
+        f"Generated: {datetime.now(timezone.utc).isoformat()}",
+        "",
+        "## Scan scope",
+        f"- Objects scanned: **{len(entities)}**",
+        f"- System objects excluded: **{excluded_count}**",
+        f"- Objects with PII findings: "
+        f"**{sum(1 for e in entities if e['pii_count'] > 0)}**",
+        "",
+    ]
+
+    # Risk summary
+    risk_counts: dict[str, int] = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+    for e in entities:
+        for f in e["pii_fields"]:
+            risk_counts[f["risk_level"]] = risk_counts.get(f["risk_level"], 0) + 1
+
+    lines += [
+        "## Risk summary",
+        f"| Risk level | Field count |",
+        f"|---|---|",
+    ]
+    for level in ("Critical", "High", "Medium", "Low"):
+        lines.append(f"| {level} | {risk_counts[level]} |")
+    lines.append("")
+
+    # Per-object findings
+    lines.append("## Findings by object")
+    for e in sorted(entities, key=lambda x: -x["pii_count"]):
+        if not e["pii_fields"]:
+            continue
+        rc = f"  ({e['record_count']:,} records)" if e["record_count"] else ""
+        lines += ["", f"### {e['label']} (`{e['name']}`){rc}", ""]
+        lines += [
+            "| Field | Label | Type | PII category | Risk | Confirmed | Null rate |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for f in sorted(e["pii_fields"], key=lambda x: (
+            {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}[x["risk_level"]]
+        )):
+            confirmed = ""
+            if f.get("confirmed_pii") is True:
+                confirmed = "YES"
+            elif f.get("confirmed_pii") is False:
+                confirmed = "no"
+            nr = f"{f['null_rate']:.0%}" if f["null_rate"] is not None else "-"
+            lines.append(
+                f"| `{f['field_name']}` | {f['field_label']} | {f['field_type']} "
+                f"| {f['pii_category']} | {f['risk_level']} | {confirmed} | {nr} |"
+            )
+
+    lines += [
+        "",
+        "## Recommended actions",
+        "",
+        "**Critical / Credentials** — rotate immediately, mask in all exports",
+        "**High (Direct identifiers, Financial, Health, Biometric)** — field-level"
+        " encryption, restrict FLS to minimum required profiles",
+        "**Medium (Quasi-identifiers, Location, Free text)** — review data "
+        "retention policy, enable audit trail, apply masking in non-prod orgs",
+        "**Low (Behavioral)** — document purpose, review retention",
+        "",
+        "### Quick FLS remediation SOQL",
+        "```sql",
+        "-- Find all profiles with access to a specific sensitive field",
+        "SELECT Id, Parent.Name, Field, PermissionsRead, PermissionsEdit",
+        "FROM FieldPermissions",
+        "WHERE Field = 'Contact.SSN__c'",
+        "ORDER BY Parent.Name",
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def export_csv(entities: list[dict], path: Path) -> None:
+    fieldnames = [
+        "object_api_name", "object_label", "object_custom",
+        "field_api_name", "field_label", "field_type",
+        "pii_category", "risk_level", "matched_rule",
+        "nullable", "custom_field",
+        "null_rate", "distinct_count", "confirmed_pii",
+        "record_count",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for e in entities:
+            for fld in e["pii_fields"]:
+                w.writerow({
+                    "object_api_name": e["name"],
+                    "object_label":    e["label"],
+                    "object_custom":   e["custom"],
+                    "field_api_name":  fld["field_name"],
+                    "field_label":     fld["field_label"],
+                    "field_type":      fld["field_type"],
+                    "pii_category":    fld["pii_category"],
+                    "risk_level":      fld["risk_level"],
+                    "matched_rule":    fld["matched_rule"],
+                    "nullable":        fld["nullable"],
+                    "custom_field":    fld["custom"],
+                    "null_rate":       fld["null_rate"],
+                    "distinct_count":  fld["distinct_count"],
+                    "confirmed_pii":   fld.get("confirmed_pii"),
+                    "record_count":    e["record_count"],
+                })
+
+
+def print_summary(entities: list[dict], excluded: list[dict]) -> None:
+    pii_objects  = [e for e in entities if e["pii_count"] > 0]
+    total_fields = sum(e["pii_count"] for e in entities)
+
+    from collections import Counter
+    by_risk = Counter(
+        f["risk_level"] for e in entities for f in e["pii_fields"]
+    )
+    by_cat  = Counter(
+        f["pii_category"] for e in entities for f in e["pii_fields"]
+    )
+
+    print("\n" + "=" * 65)
+    print("  SALESFORCE PII DISCOVERY REPORT")
+    print("=" * 65)
+    print(f"  Objects scanned          : {len(entities)}")
+    print(f"  System objects excluded  : {len(excluded)}")
+    print(f"  Objects with PII         : {len(pii_objects)}")
+    print(f"  Total PII fields found   : {total_fields}")
+    print()
+    print("  Risk breakdown:")
+    for lvl in ("Critical", "High", "Medium", "Low"):
+        print(f"    {lvl:<12} {by_risk.get(lvl, 0):>4} fields")
+    print()
+    print("  PII categories:")
+    for cat, cnt in by_cat.most_common():
+        print(f"    {cat:<22} {cnt:>4} fields")
+    print()
+    print("  Top objects by PII field count:")
+    for e in sorted(pii_objects, key=lambda x: -x["pii_count"])[:15]:
+        rc = f"({e['record_count']:,} rec)" if e["record_count"] else ""
+        print(f"    {e['name']:<40} {e['pii_count']:>3} PII fields  {rc}")
+    print("=" * 65)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Salesforce PII Discovery — with full system object exclusion",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full scan (metadata only — no record access)
+  python sf_pii_discovery.py --username me@org.com --password p --token T
+
+  # With data sampling to confirm PII in real records
+  python sf_pii_discovery.py --username me@org.com --password p --token T --sample 200
+
+  # Sandbox
+  python sf_pii_discovery.py --username me@sb.com --password p --token T --domain test
+
+  # Custom objects only + sampling
+  python sf_pii_discovery.py --username me@org.com --password p --token T --custom-only --sample 100
+        """
+    )
+    ap.add_argument("--username",       required=True)
+    ap.add_argument("--password",       required=True)
+    ap.add_argument("--token",          default="",    help="Salesforce security token")
+    ap.add_argument("--client-id",      default="",    help="Connected app consumer key")
+    ap.add_argument("--client-secret",  default="",    help="Connected app consumer secret")
+    ap.add_argument("--domain",         default="login", help="login (prod) or test (sandbox)")
+    ap.add_argument("--objects",        default="",    help="Comma-separated object names")
+    ap.add_argument("--custom-only",    action="store_true")
+    ap.add_argument("--sample",         type=int, default=0,
+                    help="Records to sample per object (0 = metadata only)")
+    ap.add_argument("--output-dir",     default="sf_pii_report")
+    args = ap.parse_args()
+
+    # Connect
+    sf = connect(args)
+
+    # Object scan with system exclusion
+    included, excluded = scan_objects(sf, args)
+    if not included:
+        log.error("No objects to scan after exclusion filters.")
+        sys.exit(1)
+
+    # Describe + classify each object
+    entities: list[dict] = []
+    total = len(included)
+    for i, obj_meta in enumerate(included, 1):
+        name = obj_meta["name"]
+        log.info("[%d/%d] Classifying %s", i, total, name)
+        entity = describe_and_classify(sf, obj_meta)
+        if entity:
+            entities.append(entity)
+        time.sleep(0.05)
+
+    # Data sampling (optional)
+    if args.sample > 0:
+        pii_objects = [e for e in entities if e["pii_count"] > 0]
+        log.info("Sampling %d objects with PII findings (%d records each)…",
+                 len(pii_objects), args.sample)
+        for i, entity in enumerate(pii_objects, 1):
+            log.info("[%d/%d] Sampling %s", i, len(pii_objects), entity["name"])
+            sample_object_pii(sf, entity, args.sample)
+            time.sleep(0.1)
+
+    # Write outputs
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # pii_report.json
+    report_data = {
+        "generated":        datetime.now(timezone.utc).isoformat(),
+        "org_instance":     sf.sf_instance,
+        "objects_scanned":  len(entities),
+        "objects_excluded": len(excluded),
+        "sample_size":      args.sample,
+        "entities":         entities,
+        "excluded_objects": [
+            {"name": e["name"], "reason": e.get("_exclusion_reason")}
+            for e in excluded
+        ],
+    }
+    rp = out / "pii_report.json"
+    with rp.open("w", encoding="utf-8") as f:
+        json.dump(report_data, f, indent=2, default=str)
+    log.info("Saved: %s", rp)
+
+    # pii_summary.csv
+    cp = out / "pii_summary.csv"
+    export_csv(entities, cp)
+    log.info("Saved: %s", cp)
+
+    # excluded_objects.json — audit trail
+    ep = out / "excluded_objects.json"
+    with ep.open("w", encoding="utf-8") as f:
+        json.dump(
+            [{"name": e["name"], "label": e.get("label"), "reason": e.get("_exclusion_reason")}
+             for e in excluded],
+            f, indent=2
+        )
+    log.info("Saved: %s", ep)
+
+    # pii_remediation.md
+    mp = out / "pii_remediation.md"
+    with mp.open("w", encoding="utf-8") as f:
+        f.write(generate_remediation_md(entities, len(excluded)))
+    log.info("Saved: %s", mp)
+
+    # Print summary
+    print_summary(entities, excluded)
+    print(f"\n  Output directory:  {out.resolve()}/")
+    print(f"    pii_report.json      — full findings with field details")
+    print(f"    pii_summary.csv      — flat CSV for Excel / data catalog")
+    print(f"    excluded_objects.json— audit trail of system objects skipped")
+    print(f"    pii_remediation.md   — remediation guide with SOQL examples")
+
+
+if __name__ == "__main__":
+    main()
