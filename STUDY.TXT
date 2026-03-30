@@ -1,1 +1,60 @@
+-----MAR 29-----
+AI Security Architecture: The 97% Stack
 
+
+Layer 6: Output Validation (Red)
+PII Redaction
+
+Countermeasures
+
+Guardrails AI
+
+Response Filters
+
+Layer 5: Access Controls (Orange)
+RBAC (Role-Based Access Control)
+
+Azure RBAC
+
+IAM Policies
+
+Least Privilege
+
+Layer 4: Network Segmentation (Green)
+VPC (Virtual Private Cloud)
+
+Private Endpoints
+
+Zero Trust
+
+Microsegmentation
+
+Layer 3: Monitoring (Teal)
+Immutable Logs
+
+SIEM (Security Information and Event Management)
+
+Audit Trails
+
+Datadog
+
+Layer 2: Data Isolation (Blue)
+Key Vault
+
+Tenant Isolation
+
+CMEK (Customer-Managed Encryption Keys)
+
+Secrets Manager
+
+Layer 1: Identity (Purple)
+Managed Identity
+
+No Shared Keys
+
+Entra ID
+
+Service Principals
+
+
+------------
