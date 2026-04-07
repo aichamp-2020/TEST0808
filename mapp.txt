@@ -1,0 +1,310 @@
+"""
+Platform Governance PoC - Main Entry Point
+Validates: Drift Detection | Reversion Workflow | Compliance Reporting | RBAC Enforcement
+Powered by: Anthropic Claude SDK + GitHub Copilot
+"""
+
+import asyncio
+import argparse
+from rich.console import Console
+from rich.panel import Panel
+
+from agents.drift_detector import DriftDetectionAgent
+from agents.compliance_reporter import ComplianceReportAgent
+from agents.rbac_enforcer import RBACEnforcementAgent
+from agents.onboarding_validator import OnboardingValidatorAgent
+from agents.access_discovery import AccessDiscoveryAgent
+from config import GovernanceConfig
+
+console = Console()
+
+
+async def run_full_governance_check(config: GovernanceConfig):
+    """Run all governance checks end-to-end."""
+    console.print(Panel.fit(
+        "[bold cyan]Platform Governance PoC[/bold cyan]\n"
+        "Cloud Compliance | Drift Detection | RBAC | Reporting",
+        border_style="cyan"
+    ))
+
+    # 1. Drift Detection
+    console.rule("[bold yellow]Step 1: Infrastructure Drift Detection[/bold yellow]")
+    drift_agent = DriftDetectionAgent(config)
+    drift_report = await drift_agent.run()
+    console.print(drift_report.summary())
+
+    # 2. RBAC Enforcement
+    console.rule("[bold yellow]Step 2: RBAC Enforcement Check[/bold yellow]")
+    rbac_agent = RBACEnforcementAgent(config)
+    rbac_report = await rbac_agent.run()
+    console.print(rbac_report.summary())
+
+    # 3. Onboarding Validation
+    console.rule("[bold yellow]Step 3: Onboarding Checklist Validation[/bold yellow]")
+    onboard_agent = OnboardingValidatorAgent(config)
+    onboard_report = await onboard_agent.run()
+    console.print(onboard_report.summary())
+
+    # 4. AI-Powered Compliance Report (Claude)
+    console.rule("[bold yellow]Step 4: AI Compliance Report (Claude)[/bold yellow]")
+    report_agent = ComplianceReportAgent(config)
+    final_report = await report_agent.generate(
+        drift_report=drift_report,
+        rbac_report=rbac_report,
+        onboard_report=onboard_report,
+    )
+    console.print(final_report)
+
+    # 5. Export
+    report_agent.export_to_json(
+        drift_report, rbac_report, onboard_report, final_report
+    )
+    console.print("\n[green]✅ Governance report exported to: governance_report.json[/green]")
+
+
+async def run_access_discover(config: GovernanceConfig, principal: str):
+    """Discover ALL resources a principal has access to."""
+    console.rule(f"[bold yellow]Access Discovery — {principal}[/bold yellow]")
+    agent = AccessDiscoveryAgent(config)
+    report = await agent.discover(principal)
+    agent.print_discover_report(report)
+
+    import json
+    out = f"access_discover_{principal.replace(' ', '_')}.json"
+    with open(out, "w") as f:
+        json.dump(report.to_dict(), f, indent=2)
+    console.print(f"\n[green]✅ Access discovery report exported to: {out}[/green]")
+
+
+async def run_access_check(config: GovernanceConfig, principal: str, resource: str):
+    """Check if a principal has access to a specific Azure resource."""
+    console.rule(f"[bold yellow]Access Check — {principal} → {resource}[/bold yellow]")
+    agent = AccessDiscoveryAgent(config)
+    report = await agent.check(principal, resource)
+    agent.print_check_report(report)
+
+    import json
+    out = f"access_check_{principal.replace(' ', '_')}.json"
+    with open(out, "w") as f:
+        json.dump(report.to_dict(), f, indent=2)
+    console.print(f"\n[green]✅ Access check report exported to: {out}[/green]")
+
+
+async def run_access_grant(
+    config: GovernanceConfig,
+    principal: str,
+    role: str,
+    resource: str,
+    granted_by: str,
+    dry_run: bool,
+    confirm: bool,
+):
+    """Grant a role to a User / SPN / ACL on an Azure resource."""
+    console.rule(f"[bold yellow]Access Grant — {principal} → {role}[/bold yellow]")
+    agent  = AccessDiscoveryAgent(config)
+    result = await agent.grant(
+        principal=principal,
+        role=role,
+        resource=resource,
+        granted_by=granted_by,
+        dry_run=dry_run,
+        confirm_high_risk=confirm,
+    )
+    import json
+    out = f"grant_{principal.replace(' ', '_')}_{role.replace(' ', '_')}.json"
+    with open(out, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+    console.print(f"\n[green]✅ Grant result exported to: {out}[/green]")
+    console.print(f"[dim]Audit trail appended to: grant_audit_log.json[/dim]")
+
+
+async def run_access_revoke(
+    config: GovernanceConfig,
+    principal: str,
+    role: str,
+    resource: str,
+    revoked_by: str,
+    dry_run: bool,
+):
+    """Revoke a role from a User / SPN / ACL on an Azure resource."""
+    console.rule(f"[bold yellow]Access Revoke — {principal} ✖ {role}[/bold yellow]")
+    agent  = AccessDiscoveryAgent(config)
+    result = await agent.revoke(
+        principal=principal,
+        role=role,
+        resource=resource,
+        revoked_by=revoked_by,
+        dry_run=dry_run,
+    )
+    import json
+    out = f"revoke_{principal.replace(' ', '_')}_{role.replace(' ', '_')}.json"
+    with open(out, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+    console.print(f"\n[green]✅ Revoke result exported to: {out}[/green]")
+    console.print(f"[dim]Audit trail appended to: grant_audit_log.json[/dim]")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Platform Governance PoC",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full governance check
+  python main.py --mode full --repo insurance-repo --env dev
+
+  # Discover ALL resources a principal has access to
+  python main.py --mode discover --principal spn-platform-governance
+
+  # Check access to a specific resource
+  python main.py --mode check --principal spn-data-pipeline \\
+      --resource /subscriptions/sub-insurance-001/resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stginsurance
+
+  # Grant a role (dry-run first — always recommended)
+  python main.py --mode grant --principal spn-data-pipeline \\
+      --role "Storage Blob Data Reader" \\
+      --resource /subscriptions/sub-insurance-001/resourceGroups/rg-data \\
+      --dry-run
+
+  # Grant for real
+  python main.py --mode grant --principal spn-data-pipeline \\
+      --role "Storage Blob Data Reader" \\
+      --resource /subscriptions/sub-insurance-001/resourceGroups/rg-data
+
+  # Grant a high-risk role (Owner/UAA) — requires --confirm
+  python main.py --mode grant --principal acl-platform-team \\
+      --role Owner \\
+      --resource /subscriptions/sub-insurance-001 \\
+      --confirm --dry-run
+
+  # Revoke a role
+  python main.py --mode revoke --principal spn-aks-cluster \\
+      --role "Network Contributor" \\
+      --resource /subscriptions/sub-insurance-001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-main
+        """,
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["full", "drift", "rbac", "onboard", "report",
+                 "discover", "check", "grant", "revoke"],
+        default="full",
+        help=(
+            "full | drift | rbac | onboard | report | "
+            "discover | check | grant | revoke"
+        ),
+    )
+    parser.add_argument("--repo",       default="insurance-repo")
+    parser.add_argument("--env",        choices=["dev", "uat", "prod"], default="dev")
+    parser.add_argument("--principal",  default="spn-platform-governance",
+                        help="SPN / Group / User — display name, Object ID, or App ID")
+    parser.add_argument("--role",       default="Reader",
+                        help="Azure built-in role name (e.g. 'Contributor', 'Storage Blob Data Reader')")
+    parser.add_argument("--resource",   default="",
+                        help="Full Azure resource path or subscription/RG scope")
+    parser.add_argument("--granted-by", default="platform-governance-tool",
+                        help="Identity performing the grant/revoke (for audit trail)")
+    parser.add_argument("--dry-run",    action="store_true",
+                        help="Validate and print plan but do NOT write any changes")
+    parser.add_argument("--confirm",    action="store_true",
+                        help="Required for high-risk roles: Owner, User Access Administrator")
+    args = parser.parse_args()
+
+    config = GovernanceConfig(repo=args.repo, env=args.env)
+
+    if args.mode == "full":
+        asyncio.run(run_full_governance_check(config))
+    elif args.mode == "drift":
+        asyncio.run(DriftDetectionAgent(config).run_and_print())
+    elif args.mode == "rbac":
+        asyncio.run(RBACEnforcementAgent(config).run_and_print())
+    elif args.mode == "onboard":
+        asyncio.run(OnboardingValidatorAgent(config).run_and_print())
+    elif args.mode == "report":
+        asyncio.run(ComplianceReportAgent(config).run_and_print())
+    elif args.mode == "discover":
+        asyncio.run(run_access_discover(config, args.principal))
+    elif args.mode == "check":
+        if not args.resource:
+            console.print("[red]--resource is required for --mode check[/red]")
+            raise SystemExit(1)
+        asyncio.run(run_access_check(config, args.principal, args.resource))
+    elif args.mode == "grant":
+        if not args.resource:
+            console.print("[red]--resource is required for --mode grant[/red]")
+            raise SystemExit(1)
+        asyncio.run(run_access_grant(
+            config, args.principal, args.role, args.resource,
+            args.granted_by, args.dry_run, args.confirm,
+        ))
+    elif args.mode == "revoke":
+        if not args.resource:
+            console.print("[red]--resource is required for --mode revoke[/red]")
+            raise SystemExit(1)
+        asyncio.run(run_access_revoke(
+            config, args.principal, args.role, args.resource,
+            args.granted_by, args.dry_run,
+        ))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Platform Governance PoC",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full governance check
+  python main.py --mode full --repo insurance-repo --env dev
+
+  # Discover ALL resources an SPN has access to
+  python main.py --mode discover --principal spn-platform-governance
+
+  # Check if SPN/ACL has access to a specific Azure resource
+  python main.py --mode check --principal spn-data-pipeline \\
+      --resource /subscriptions/sub-insurance-001/resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stginsurance
+
+  # Discover all resources an AAD group has access to
+  python main.py --mode discover --principal acl-platform-team
+        """,
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["full", "drift", "rbac", "onboard", "report", "discover", "check"],
+        default="full",
+        help=(
+            "full=all governance checks | drift | rbac | onboard | report | "
+            "discover=enumerate all access for a principal | "
+            "check=verify access to a specific resource"
+        ),
+    )
+    parser.add_argument("--repo",      default="insurance-repo", help="Target repository/domain name")
+    parser.add_argument("--env",       choices=["dev", "uat", "prod"], default="dev", help="Target environment")
+    parser.add_argument("--principal", default="spn-platform-governance",
+                        help="SPN display name, Object ID, or App ID  [used with --mode discover/check]")
+    parser.add_argument("--resource",  default="",
+                        help="Full Azure resource path  [used with --mode check]")
+    args = parser.parse_args()
+
+    config = GovernanceConfig(repo=args.repo, env=args.env)
+
+    if args.mode == "full":
+        asyncio.run(run_full_governance_check(config))
+    elif args.mode == "drift":
+        asyncio.run(DriftDetectionAgent(config).run_and_print())
+    elif args.mode == "rbac":
+        asyncio.run(RBACEnforcementAgent(config).run_and_print())
+    elif args.mode == "onboard":
+        asyncio.run(OnboardingValidatorAgent(config).run_and_print())
+    elif args.mode == "report":
+        asyncio.run(ComplianceReportAgent(config).run_and_print())
+    elif args.mode == "discover":
+        asyncio.run(run_access_discover(config, args.principal))
+    elif args.mode == "check":
+        if not args.resource:
+            console.print("[red]--resource is required for --mode check[/red]")
+            console.print("Example: --resource /subscriptions/sub-001/resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stg001")
+            raise SystemExit(1)
+        asyncio.run(run_access_check(config, args.principal, args.resource))
+
+
+if __name__ == "__main__":
+    main()

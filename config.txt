@@ -1,0 +1,54 @@
+"""
+Configuration for Platform Governance PoC
+All sensitive values loaded from environment variables / .env file
+"""
+
+import os
+from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class GovernanceConfig:
+    # Target context
+    repo: str = "insurance-repo"
+    env: str = "dev"
+
+    # Anthropic
+    anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
+    claude_model: str = "claude-sonnet-4-20250514"
+
+    # Azure (mocked for PoC — replace with real SDK calls)
+    azure_subscription_id: str = field(
+        default_factory=lambda: os.getenv("AZURE_SUBSCRIPTION_ID", "mock-sub-001")
+    )
+    azure_tenant_id: str = field(
+        default_factory=lambda: os.getenv("AZURE_TENANT_ID", "mock-tenant-001")
+    )
+    azure_resource_group: str = field(
+        default_factory=lambda: os.getenv("AZURE_RESOURCE_GROUP", "rg-platform-poc")
+    )
+
+    # Terraform state (mocked — in prod, point to Azure Blob backend)
+    terraform_state_path: str = field(
+        default_factory=lambda: os.getenv("TF_STATE_PATH", "./mock_data/terraform.tfstate.json")
+    )
+
+    # RBAC definitions
+    rbac_policy_path: str = "mock_data/rbac_policy.json"
+
+    # Onboarding checklist
+    checklist_path: str = "mock_data/onboarding_checklist.json"
+
+    # Drift reversion
+    auto_revert: bool = field(
+        default_factory=lambda: os.getenv("AUTO_REVERT", "false").lower() == "true"
+    )
+
+    def validate(self):
+        if not self.anthropic_api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY not set. Add it to your .env file."
+            )

@@ -1,0 +1,1352 @@
+"""
+Access Discovery Agent
+======================
+Mode 1 — DISCOVER: Given an SPN or ACL (Object ID / Display Name),
+         enumerate EVERY Azure resource it has access to, across all scopes:
+         Subscription → Resource Group → Resource → Child Resources
+
+Mode 2 — CHECK: Given an SPN/ACL + a specific Azure resource path,
+         confirm whether access exists and list the exact role(s) granted.
+
+Covers ALL Azure resource types via Resource Graph + Authorization APIs.
+
+Production:
+  - azure.mgmt.authorization.AuthorizationManagementClient  (role assignments)
+  - azure.mgmt.resource.ResourceManagementClient            (resource enumeration)
+  - azure.mgmt.resourcegraph.ResourceGraphClient            (cross-subscription query)
+  - azure.identity.ClientSecretCredential / DefaultAzureCredential
+
+PoC: Mock data simulates a real tenant with 3 subscriptions, 30+ resources,
+     varied role assignments across scopes.
+"""
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+from rich.console import Console
+from rich.table import Table
+from rich.tree import Tree
+from rich.panel import Panel
+from rich import print as rprint
+
+console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Azure resource type catalogue (all major namespaces)
+# ---------------------------------------------------------------------------
+AZURE_RESOURCE_TYPES = [
+    # Compute
+    "Microsoft.Compute/virtualMachines",
+    "Microsoft.Compute/virtualMachineScaleSets",
+    "Microsoft.Compute/disks",
+    "Microsoft.Compute/snapshots",
+    "Microsoft.Compute/images",
+    "Microsoft.Compute/availabilitySets",
+    # Containers
+    "Microsoft.ContainerService/managedClusters",           # AKS
+    "Microsoft.ContainerRegistry/registries",               # ACR
+    "Microsoft.ContainerInstance/containerGroups",
+    # Networking
+    "Microsoft.Network/virtualNetworks",
+    "Microsoft.Network/networkSecurityGroups",
+    "Microsoft.Network/publicIPAddresses",
+    "Microsoft.Network/loadBalancers",
+    "Microsoft.Network/applicationGateways",
+    "Microsoft.Network/privateDnsZones",
+    "Microsoft.Network/virtualNetworkGateways",
+    "Microsoft.Network/firewalls",
+    "Microsoft.Network/bastionHosts",
+    # Storage
+    "Microsoft.Storage/storageAccounts",
+    "Microsoft.DataLakeStore/accounts",
+    "Microsoft.DataLakeAnalytics/accounts",
+    # Databases
+    "Microsoft.Sql/servers",
+    "Microsoft.Sql/servers/databases",
+    "Microsoft.DBforPostgreSQL/servers",
+    "Microsoft.DBforMySQL/servers",
+    "Microsoft.DocumentDB/databaseAccounts",                # CosmosDB
+    "Microsoft.Cache/redis",
+    "Microsoft.Synapse/workspaces",
+    # Identity & Security
+    "Microsoft.KeyVault/vaults",
+    "Microsoft.ManagedIdentity/userAssignedIdentities",
+    "Microsoft.Security/securityContacts",
+    # AI / ML
+    "Microsoft.MachineLearningServices/workspaces",
+    "Microsoft.CognitiveServices/accounts",
+    "Microsoft.Search/searchServices",
+    # Messaging / Integration
+    "Microsoft.ServiceBus/namespaces",
+    "Microsoft.EventHub/namespaces",
+    "Microsoft.EventGrid/topics",
+    "Microsoft.Logic/workflows",
+    "Microsoft.ApiManagement/service",
+    # App Services
+    "Microsoft.Web/sites",
+    "Microsoft.Web/serverFarms",
+    "Microsoft.Web/staticSites",
+    # Functions / Serverless
+    "Microsoft.Web/sites/functions",
+    # Monitoring
+    "Microsoft.Insights/components",                        # App Insights
+    "Microsoft.OperationalInsights/workspaces",             # Log Analytics
+    "Microsoft.Monitor/accounts",
+    # Governance
+    "Microsoft.Authorization/policyAssignments",
+    "Microsoft.Management/managementGroups",
+]
+
+# Azure built-in role definitions with their permission scopes
+AZURE_BUILTIN_ROLES = {
+    "Owner":                        {"id": "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", "level": "FULL",    "can_assign_roles": True},
+    "Contributor":                  {"id": "b24988ac-6180-42a0-ab88-20f7382dd24c", "level": "FULL",    "can_assign_roles": False},
+    "Reader":                       {"id": "acdd72a7-3385-48ef-bd42-f606fba81ae7", "level": "READ",    "can_assign_roles": False},
+    "User Access Administrator":    {"id": "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9", "level": "UAA",    "can_assign_roles": True},
+    "Security Admin":               {"id": "fb1c8493-542b-48eb-b624-b4c8fea62acd", "level": "WRITE",   "can_assign_roles": False},
+    "Security Reader":              {"id": "39bc4728-0917-49c7-9d2c-d95423bc2eb4", "level": "READ",    "can_assign_roles": False},
+    "Key Vault Administrator":      {"id": "00482a5a-887f-4fb3-b363-3b7fe8e74483", "level": "FULL",    "can_assign_roles": False},
+    "Key Vault Secrets Officer":    {"id": "b86a8fe4-44ce-4948-aee5-eccb2c155cd7", "level": "WRITE",   "can_assign_roles": False},
+    "Key Vault Reader":             {"id": "21090545-7ca7-4776-b22c-e363652d74d2", "level": "READ",    "can_assign_roles": False},
+    "Storage Account Contributor":  {"id": "17d1049b-9a84-46fb-8f53-869881c3d3ab", "level": "FULL",    "can_assign_roles": False},
+    "Storage Blob Data Owner":      {"id": "b7e6dc6d-f1e8-4753-8033-0f276bb0955b", "level": "FULL",    "can_assign_roles": False},
+    "Storage Blob Data Reader":     {"id": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1", "level": "READ",    "can_assign_roles": False},
+    "Network Contributor":          {"id": "4d97b98b-1d4f-4787-a291-c67834d212e7", "level": "FULL",    "can_assign_roles": False},
+    "SQL DB Contributor":           {"id": "9b7fa17d-e63e-47b0-bb0a-15c516ac86ec", "level": "FULL",    "can_assign_roles": False},
+    "Monitoring Contributor":       {"id": "749f88d5-cbae-40b8-bcfc-e573ddc772fa", "level": "FULL",    "can_assign_roles": False},
+    "AKS Cluster Admin":            {"id": "0ab0b1a8-8aac-4efd-b8c2-3ee1fb270be8", "level": "FULL",    "can_assign_roles": False},
+    "Cognitive Services Contributor":{"id":"25fbc0a9-bd7c-42a3-aa1a-3b75d497ee68","level": "FULL",    "can_assign_roles": False},
+}
+
+# Scope level hierarchy
+SCOPE_HIERARCHY = ["ManagementGroup", "Subscription", "ResourceGroup", "Resource", "ChildResource"]
+
+# High-risk roles that require --confirm flag before granting
+HIGH_RISK_ROLES = {"Owner", "User Access Administrator"}
+
+# Broad scopes that trigger an extra warning
+BROAD_SCOPE_PREFIXES = ("/providers/Microsoft.Management/managementGroups", "/subscriptions/")
+
+# In-memory grant log (persisted to JSON on every write in PoC)
+# Production: write to Azure Event Hub / Log Analytics / Cosmos audit table
+_GRANT_LOG_PATH = "grant_audit_log.json"
+
+
+def _load_grant_log() -> list[dict]:
+    try:
+        with open(_GRANT_LOG_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _append_grant_log(entry: dict):
+    log = _load_grant_log()
+    log.append(entry)
+    with open(_GRANT_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GrantResult:
+    """Result of a grant or revoke operation."""
+    operation:       str            # GRANT | REVOKE
+    status:          str            # SUCCESS | DRY_RUN | DUPLICATE | BLOCKED | NOT_FOUND | ERROR
+    principal_name:  str
+    principal_type:  str
+    principal_id:    str
+    role:            str
+    role_level:      str
+    scope:           str
+    scope_type:      str
+    resource_type:   str
+    granted_by:      str            # identity that performed the grant
+    timestamp:       str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    assignment_id:   str = ""       # Azure role assignment GUID (production)
+    warnings:        list[str] = field(default_factory=list)
+    errors:          list[str] = field(default_factory=list)
+    dry_run:         bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "operation":      self.operation,
+            "status":         self.status,
+            "principal_name": self.principal_name,
+            "principal_type": self.principal_type,
+            "principal_id":   self.principal_id,
+            "role":           self.role,
+            "role_level":     self.role_level,
+            "scope":          self.scope,
+            "scope_type":     self.scope_type,
+            "resource_type":  self.resource_type,
+            "granted_by":     self.granted_by,
+            "timestamp":      self.timestamp,
+            "assignment_id":  self.assignment_id,
+            "warnings":       self.warnings,
+            "errors":         self.errors,
+            "dry_run":        self.dry_run,
+        }
+
+@dataclass
+class AccessEntry:
+    principal_id:   str
+    principal_name: str
+    principal_type: str          # ServicePrincipal | Group | User
+    role_name:      str
+    role_level:     str          # FULL | WRITE | READ | UAA
+    scope:          str          # full Azure resource path
+    scope_type:     str          # ManagementGroup | Subscription | ResourceGroup | Resource | ChildResource
+    resource_type:  str
+    subscription:   str
+    resource_group: str
+    can_assign_roles: bool
+    inherited:      bool         # True if assignment is at a parent scope
+
+
+@dataclass
+class AccessDiscoveryReport:
+    mode:              str       # DISCOVER | CHECK
+    principal_query:   str
+    target_resource:   Optional[str]
+    timestamp:         str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    entries:           list[AccessEntry] = field(default_factory=list)
+    principals_found:  list[dict] = field(default_factory=list)
+
+    # ── summary helpers ──────────────────────────────────────────────────────
+
+    def by_scope_type(self) -> dict[str, list[AccessEntry]]:
+        grouped: dict[str, list] = {}
+        for e in self.entries:
+            grouped.setdefault(e.scope_type, []).append(e)
+        return grouped
+
+    def by_resource_type(self) -> dict[str, list[AccessEntry]]:
+        grouped: dict[str, list] = {}
+        for e in self.entries:
+            grouped.setdefault(e.resource_type, []).append(e)
+        return grouped
+
+    def risky_entries(self) -> list[AccessEntry]:
+        return [e for e in self.entries if e.role_level == "FULL" or e.can_assign_roles]
+
+    # ── rich output ──────────────────────────────────────────────────────────
+
+    def summary_table(self) -> Table:
+        t = Table(
+            title=f"Access Discovery — {self.principal_query}",
+            show_lines=True, header_style="bold"
+        )
+        t.add_column("Principal", style="cyan", min_width=20)
+        t.add_column("Type", min_width=14)
+        t.add_column("Role", min_width=22)
+        t.add_column("Level", min_width=6)
+        t.add_column("Scope Type", min_width=13)
+        t.add_column("Resource / Path", min_width=30)
+        t.add_column("Res. Type", min_width=18)
+        t.add_column("Assign?", min_width=7)
+        t.add_column("Inherited", min_width=9)
+
+        for e in sorted(self.entries, key=lambda x: (x.principal_name, x.scope_type, x.scope)):
+            lvl_color = (
+                "red"    if e.role_level in ("FULL", "UAA") else
+                "yellow" if e.role_level == "WRITE" else
+                "green"
+            )
+            scope_display = e.scope.split("/")[-1] if "/" in e.scope else e.scope
+            rtype_display = e.resource_type.split("/")[-1] if "/" in e.resource_type else e.resource_type
+            t.add_row(
+                e.principal_name,
+                e.principal_type,
+                e.role_name,
+                f"[{lvl_color}]{e.role_level}[/{lvl_color}]",
+                e.scope_type,
+                scope_display,
+                rtype_display,
+                "⚠ YES" if e.can_assign_roles else "no",
+                "↑ yes" if e.inherited else "direct",
+            )
+        return t
+
+    def risk_table(self) -> Table:
+        risky = self.risky_entries()
+        t = Table(title="⚠  High-Risk Assignments (FULL / can assign roles)", show_lines=True)
+        t.add_column("Principal", style="cyan")
+        t.add_column("Role", style="red")
+        t.add_column("Scope")
+        t.add_column("Risk Reason", style="yellow")
+        for e in risky:
+            reasons = []
+            if e.role_level == "FULL": reasons.append("Full control")
+            if e.can_assign_roles:     reasons.append("Can grant roles to others")
+            if e.scope_type in ("Subscription", "ManagementGroup"):
+                reasons.append("Broad scope — entire subscription")
+            t.add_row(e.principal_name, e.role_name, e.scope.split("/")[-1], " | ".join(reasons))
+        return t
+
+    def scope_tree(self) -> Tree:
+        tree = Tree(f"[bold cyan]Access tree — {self.principal_query}[/bold cyan]")
+        by_sub: dict[str, dict] = {}
+        for e in self.entries:
+            by_sub.setdefault(e.subscription, {}).setdefault(e.resource_group or "(subscription-level)", []).append(e)
+        for sub, rgs in by_sub.items():
+            sub_node = tree.add(f"[yellow]Subscription:[/yellow] {sub}")
+            for rg, entries in rgs.items():
+                rg_node = sub_node.add(f"[blue]ResourceGroup:[/blue] {rg}")
+                for e in entries:
+                    res_name = e.scope.split("/")[-1]
+                    lvl_color = "red" if e.role_level in ("FULL","UAA") else "yellow" if e.role_level == "WRITE" else "green"
+                    rg_node.add(
+                        f"[{lvl_color}]{e.role_name}[/{lvl_color}] → "
+                        f"{res_name} [dim]({e.resource_type.split('/')[-1]})[/dim]"
+                        f"{'  [red]⚠ can-assign[/red]' if e.can_assign_roles else ''}"
+                    )
+        return tree
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": self.mode,
+            "principal_query": self.principal_query,
+            "target_resource": self.target_resource,
+            "timestamp": self.timestamp,
+            "principals_found": self.principals_found,
+            "total_access_entries": len(self.entries),
+            "high_risk_count": len(self.risky_entries()),
+            "by_scope_type": {
+                k: len(v) for k, v in self.by_scope_type().items()
+            },
+            "by_resource_type": {
+                k: len(v) for k, v in self.by_resource_type().items()
+            },
+            "entries": [
+                {
+                    "principal_name": e.principal_name,
+                    "principal_type": e.principal_type,
+                    "role": e.role_name,
+                    "role_level": e.role_level,
+                    "scope": e.scope,
+                    "scope_type": e.scope_type,
+                    "resource_type": e.resource_type,
+                    "subscription": e.subscription,
+                    "resource_group": e.resource_group,
+                    "can_assign_roles": e.can_assign_roles,
+                    "inherited": e.inherited,
+                }
+                for e in self.entries
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Mock data factory — simulates a real tenant
+# ---------------------------------------------------------------------------
+
+def _mock_tenant() -> dict:
+    """
+    Returns a realistic mock Azure tenant with:
+    - 2 subscriptions
+    - Multiple resource groups
+    - 30+ resources of varied types
+    - Several SPNs / AAD groups with varied role assignments
+    """
+    return {
+        "principals": [
+            {
+                "object_id":    "spn-001-oid",
+                "display_name": "spn-platform-governance",
+                "type":         "ServicePrincipal",
+                "app_id":       "app-001-guid",
+            },
+            {
+                "object_id":    "spn-002-oid",
+                "display_name": "spn-data-pipeline",
+                "type":         "ServicePrincipal",
+                "app_id":       "app-002-guid",
+            },
+            {
+                "object_id":    "spn-003-oid",
+                "display_name": "spn-aks-cluster",
+                "type":         "ServicePrincipal",
+                "app_id":       "app-003-guid",
+            },
+            {
+                "object_id":    "grp-001-oid",
+                "display_name": "acl-platform-team",
+                "type":         "Group",
+                "app_id":       None,
+            },
+            {
+                "object_id":    "grp-002-oid",
+                "display_name": "acl-security-team",
+                "type":         "Group",
+                "app_id":       None,
+            },
+        ],
+        "subscriptions": [
+            {"id": "sub-insurance-001", "name": "Insurance-Production"},
+            {"id": "sub-banking-001",   "name": "Banking-Dev"},
+        ],
+        "role_assignments": [
+            # ── spn-platform-governance ─────────────────────────────────────
+            # Contributor at subscription scope (inherited by everything below)
+            {
+                "principal_id": "spn-001-oid",
+                "role": "Contributor",
+                "scope": "/subscriptions/sub-insurance-001",
+                "scope_type": "Subscription",
+                "subscription": "Insurance-Production",
+                "resource_group": "",
+                "resource_type": "Microsoft.Management/subscriptions",
+                "inherited": False,
+            },
+            # Explicit Key Vault Administrator on specific vault
+            {
+                "principal_id": "spn-001-oid",
+                "role": "Key Vault Administrator",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-platform-poc/providers/Microsoft.KeyVault/vaults/kv-platform-poc",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-platform-poc",
+                "resource_type": "Microsoft.KeyVault/vaults",
+                "inherited": False,
+            },
+            # Storage Blob Data Owner on storage account
+            {
+                "principal_id": "spn-001-oid",
+                "role": "Storage Blob Data Owner",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stginsurance",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-data",
+                "resource_type": "Microsoft.Storage/storageAccounts",
+                "inherited": False,
+            },
+            # Reader on banking sub (cross-subscription)
+            {
+                "principal_id": "spn-001-oid",
+                "role": "Reader",
+                "scope": "/subscriptions/sub-banking-001",
+                "scope_type": "Subscription",
+                "subscription": "Banking-Dev",
+                "resource_group": "",
+                "resource_type": "Microsoft.Management/subscriptions",
+                "inherited": False,
+            },
+
+            # ── spn-data-pipeline ────────────────────────────────────────────
+            {
+                "principal_id": "spn-002-oid",
+                "role": "Storage Blob Data Reader",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stginsurance",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-data",
+                "resource_type": "Microsoft.Storage/storageAccounts",
+                "inherited": False,
+            },
+            {
+                "principal_id": "spn-002-oid",
+                "role": "Contributor",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-data",
+                "scope_type": "ResourceGroup",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-data",
+                "resource_type": "Microsoft.Resources/resourceGroups",
+                "inherited": False,
+            },
+            {
+                "principal_id": "spn-002-oid",
+                "role": "SQL DB Contributor",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-data/providers/Microsoft.Sql/servers/sql-insurance/databases/db-claims",
+                "scope_type": "ChildResource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-data",
+                "resource_type": "Microsoft.Sql/servers/databases",
+                "inherited": False,
+            },
+            {
+                "principal_id": "spn-002-oid",
+                "role": "Cognitive Services Contributor",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-ai/providers/Microsoft.CognitiveServices/accounts/oai-insurance",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-ai",
+                "resource_type": "Microsoft.CognitiveServices/accounts",
+                "inherited": False,
+            },
+
+            # ── spn-aks-cluster ──────────────────────────────────────────────
+            {
+                "principal_id": "spn-003-oid",
+                "role": "AKS Cluster Admin",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-compute/providers/Microsoft.ContainerService/managedClusters/aks-insurance",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-compute",
+                "resource_type": "Microsoft.ContainerService/managedClusters",
+                "inherited": False,
+            },
+            {
+                "principal_id": "spn-003-oid",
+                "role": "Network Contributor",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-main",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-network",
+                "resource_type": "Microsoft.Network/virtualNetworks",
+                "inherited": False,
+            },
+            {
+                "principal_id": "spn-003-oid",
+                "role": "Storage Account Contributor",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-compute/providers/Microsoft.Storage/storageAccounts/stgaks",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-compute",
+                "resource_type": "Microsoft.Storage/storageAccounts",
+                "inherited": False,
+            },
+            {
+                "principal_id": "spn-003-oid",
+                "role": "Key Vault Secrets Officer",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-compute/providers/Microsoft.KeyVault/vaults/kv-aks",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-compute",
+                "resource_type": "Microsoft.KeyVault/vaults",
+                "inherited": False,
+            },
+
+            # ── acl-platform-team ────────────────────────────────────────────
+            {
+                "principal_id": "grp-001-oid",
+                "role": "Contributor",
+                "scope": "/subscriptions/sub-insurance-001",
+                "scope_type": "Subscription",
+                "subscription": "Insurance-Production",
+                "resource_group": "",
+                "resource_type": "Microsoft.Management/subscriptions",
+                "inherited": False,
+            },
+            {
+                "principal_id": "grp-001-oid",
+                "role": "Contributor",
+                "scope": "/subscriptions/sub-banking-001",
+                "scope_type": "Subscription",
+                "subscription": "Banking-Dev",
+                "resource_group": "",
+                "resource_type": "Microsoft.Management/subscriptions",
+                "inherited": False,
+            },
+            {
+                "principal_id": "grp-001-oid",
+                "role": "Key Vault Administrator",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-platform-poc/providers/Microsoft.KeyVault/vaults/kv-platform-poc",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-platform-poc",
+                "resource_type": "Microsoft.KeyVault/vaults",
+                "inherited": False,
+            },
+
+            # ── acl-security-team ────────────────────────────────────────────
+            {
+                "principal_id": "grp-002-oid",
+                "role": "Security Reader",
+                "scope": "/subscriptions/sub-insurance-001",
+                "scope_type": "Subscription",
+                "subscription": "Insurance-Production",
+                "resource_group": "",
+                "resource_type": "Microsoft.Management/subscriptions",
+                "inherited": False,
+            },
+            {
+                "principal_id": "grp-002-oid",
+                "role": "Key Vault Reader",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-platform-poc/providers/Microsoft.KeyVault/vaults/kv-platform-poc",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-platform-poc",
+                "resource_type": "Microsoft.KeyVault/vaults",
+                "inherited": False,
+            },
+            {
+                "principal_id": "grp-002-oid",
+                "role": "Monitoring Contributor",
+                "scope": "/subscriptions/sub-insurance-001/resourceGroups/rg-monitor/providers/Microsoft.OperationalInsights/workspaces/law-insurance",
+                "scope_type": "Resource",
+                "subscription": "Insurance-Production",
+                "resource_group": "rg-monitor",
+                "resource_type": "Microsoft.OperationalInsights/workspaces",
+                "inherited": False,
+            },
+        ],
+    }
+
+
+def _resolve_inherited(assignments: list[dict]) -> list[dict]:
+    """
+    For every subscription-level or resource-group-level assignment,
+    generate inherited entries for common child resource types so the
+    'discover' mode shows the full blast radius.
+    """
+    extra = []
+    child_resources_per_rg = {
+        "rg-platform-poc": [
+            ("/providers/Microsoft.KeyVault/vaults/kv-platform-poc",     "Microsoft.KeyVault/vaults"),
+            ("/providers/Microsoft.Storage/storageAccounts/stgplatformpoc", "Microsoft.Storage/storageAccounts"),
+            ("/providers/Microsoft.Network/virtualNetworks/vnet-main",   "Microsoft.Network/virtualNetworks"),
+        ],
+        "rg-data": [
+            ("/providers/Microsoft.Storage/storageAccounts/stginsurance", "Microsoft.Storage/storageAccounts"),
+            ("/providers/Microsoft.Sql/servers/sql-insurance",            "Microsoft.Sql/servers"),
+            ("/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-ins","Microsoft.DocumentDB/databaseAccounts"),
+            ("/providers/Microsoft.Cache/redis/redis-insurance",           "Microsoft.Cache/redis"),
+            ("/providers/Microsoft.Synapse/workspaces/synapse-insurance",  "Microsoft.Synapse/workspaces"),
+        ],
+        "rg-compute": [
+            ("/providers/Microsoft.Compute/virtualMachines/vm-app-001",  "Microsoft.Compute/virtualMachines"),
+            ("/providers/Microsoft.Compute/virtualMachines/vm-app-002",  "Microsoft.Compute/virtualMachines"),
+            ("/providers/Microsoft.ContainerService/managedClusters/aks-insurance", "Microsoft.ContainerService/managedClusters"),
+            ("/providers/Microsoft.ContainerRegistry/registries/acrinsurance", "Microsoft.ContainerRegistry/registries"),
+        ],
+        "rg-network": [
+            ("/providers/Microsoft.Network/virtualNetworks/vnet-main",   "Microsoft.Network/virtualNetworks"),
+            ("/providers/Microsoft.Network/networkSecurityGroups/nsg-app","Microsoft.Network/networkSecurityGroups"),
+            ("/providers/Microsoft.Network/publicIPAddresses/pip-gateway","Microsoft.Network/publicIPAddresses"),
+            ("/providers/Microsoft.Network/applicationGateways/agw-main","Microsoft.Network/applicationGateways"),
+            ("/providers/Microsoft.Network/firewalls/fw-insurance",       "Microsoft.Network/firewalls"),
+        ],
+        "rg-ai": [
+            ("/providers/Microsoft.CognitiveServices/accounts/oai-insurance","Microsoft.CognitiveServices/accounts"),
+            ("/providers/Microsoft.MachineLearningServices/workspaces/aml-insurance","Microsoft.MachineLearningServices/workspaces"),
+            ("/providers/Microsoft.Search/searchServices/srch-insurance","Microsoft.Search/searchServices"),
+        ],
+        "rg-monitor": [
+            ("/providers/Microsoft.Insights/components/appi-insurance",   "Microsoft.Insights/components"),
+            ("/providers/Microsoft.OperationalInsights/workspaces/law-insurance","Microsoft.OperationalInsights/workspaces"),
+        ],
+        "rg-integration": [
+            ("/providers/Microsoft.ServiceBus/namespaces/sb-insurance",   "Microsoft.ServiceBus/namespaces"),
+            ("/providers/Microsoft.EventHub/namespaces/evh-insurance",    "Microsoft.EventHub/namespaces"),
+            ("/providers/Microsoft.ApiManagement/service/apim-insurance", "Microsoft.ApiManagement/service"),
+            ("/providers/Microsoft.Logic/workflows/logic-claims",         "Microsoft.Logic/workflows"),
+        ],
+        "rg-web": [
+            ("/providers/Microsoft.Web/sites/app-insurance-portal",       "Microsoft.Web/sites"),
+            ("/providers/Microsoft.Web/serverFarms/asp-insurance",        "Microsoft.Web/serverFarms"),
+        ],
+    }
+
+    for a in assignments:
+        if a["scope_type"] == "Subscription":
+            # Subscription-level role → inherited by ALL resource groups and resources
+            for rg, resources in child_resources_per_rg.items():
+                extra.append({**a,
+                    "scope": f"/subscriptions/{a['scope'].split('/')[-1]}/resourceGroups/{rg}",
+                    "scope_type": "ResourceGroup",
+                    "resource_group": rg,
+                    "resource_type": "Microsoft.Resources/resourceGroups",
+                    "inherited": True,
+                })
+                for res_path, res_type in resources:
+                    extra.append({**a,
+                        "scope": f"/subscriptions/{a['scope'].split('/')[-1]}/resourceGroups/{rg}{res_path}",
+                        "scope_type": "Resource",
+                        "resource_group": rg,
+                        "resource_type": res_type,
+                        "inherited": True,
+                    })
+        elif a["scope_type"] == "ResourceGroup":
+            rg = a["resource_group"]
+            for res_path, res_type in child_resources_per_rg.get(rg, []):
+                sub_id = a["scope"].split("/resourceGroups")[0].split("/subscriptions/")[-1]
+                extra.append({**a,
+                    "scope": f"/subscriptions/{sub_id}/resourceGroups/{rg}{res_path}",
+                    "scope_type": "Resource",
+                    "resource_group": rg,
+                    "resource_type": res_type,
+                    "inherited": True,
+                })
+    return extra
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+class AccessDiscoveryAgent:
+    """
+    Discovers and validates Azure access for Service Principals and AAD Groups.
+
+    Usage:
+        agent = AccessDiscoveryAgent(config)
+
+        # Mode 1: Discover everything a principal has access to
+        report = await agent.discover(principal="spn-platform-governance")
+
+        # Mode 2: Check if a principal has access to a specific resource
+        report = await agent.check(
+            principal="spn-data-pipeline",
+            resource="/subscriptions/.../resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stginsurance"
+        )
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    # ── private helpers ──────────────────────────────────────────────────────
+
+    def _find_principals(self, query: str, tenant: dict) -> list[dict]:
+        """
+        Resolve query → list of matching principals.
+        Matches on: display_name (partial), object_id (exact), app_id (exact).
+        """
+        q = query.lower().strip()
+        return [
+            p for p in tenant["principals"]
+            if q in p["display_name"].lower()
+            or q == p["object_id"].lower()
+            or (p.get("app_id") and q == p["app_id"].lower())
+        ]
+
+    def _build_entries(
+        self,
+        principal: dict,
+        assignments: list[dict],
+        resource_filter: Optional[str] = None,
+    ) -> list[AccessEntry]:
+        """
+        Convert raw role assignment dicts → AccessEntry objects,
+        optionally filtered to a specific resource path.
+        """
+        entries = []
+        role_meta = AZURE_BUILTIN_ROLES
+
+        for a in assignments:
+            if a["principal_id"] != principal["object_id"]:
+                continue
+
+            scope = a["scope"]
+
+            # Resource filter: check if assignment applies to the target
+            if resource_filter:
+                rf = resource_filter.lower()
+                if not (scope.lower() == rf
+                        or rf.startswith(scope.lower())   # target is under this scope
+                        or scope.lower().startswith(rf)): # scope is under target (child)
+                    continue
+
+            role = a["role"]
+            meta = role_meta.get(role, {"level": "WRITE", "can_assign_roles": False})
+            entries.append(AccessEntry(
+                principal_id=principal["object_id"],
+                principal_name=principal["display_name"],
+                principal_type=principal["type"],
+                role_name=role,
+                role_level=meta["level"],
+                scope=scope,
+                scope_type=a["scope_type"],
+                resource_type=a["resource_type"],
+                subscription=a["subscription"],
+                resource_group=a.get("resource_group", ""),
+                can_assign_roles=meta["can_assign_roles"],
+                inherited=a.get("inherited", False),
+            ))
+        return entries
+
+    def _get_all_assignments(self, tenant: dict) -> list[dict]:
+        """Merge direct + inherited assignments."""
+        direct = tenant["role_assignments"]
+        inherited = _resolve_inherited(direct)
+        # Deduplicate by (principal_id, role, scope)
+        seen = set()
+        merged = []
+        for a in direct + inherited:
+            key = (a["principal_id"], a["role"], a["scope"])
+            if key not in seen:
+                seen.add(key)
+                merged.append(a)
+        return merged
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    async def discover(self, principal: str) -> "AccessDiscoveryReport":
+        """
+        Mode 1: Return EVERY resource the principal has access to,
+        across all subscriptions, resource groups, and resources.
+
+        Production wire-up:
+            credential = DefaultAzureCredential()
+            auth_client = AuthorizationManagementClient(credential, subscription_id)
+            assignments = auth_client.role_assignments.list(
+                filter=f"principalId eq '{object_id}'"
+            )
+        """
+        console.print(f"\n[cyan]ACCESS DISCOVERY — principal: [bold]{principal}[/bold][/cyan]")
+        tenant = _mock_tenant()
+        all_assignments = self._get_all_assignments(tenant)
+
+        principals_found = self._find_principals(principal, tenant)
+        if not principals_found:
+            console.print(f"[red]No principal found matching '{principal}'[/red]")
+            return AccessDiscoveryReport(
+                mode="DISCOVER", principal_query=principal, target_resource=None
+            )
+
+        all_entries = []
+        for p in principals_found:
+            console.print(f"  [green]Found:[/green] {p['display_name']} ({p['type']})")
+            all_entries += self._build_entries(p, all_assignments)
+
+        report = AccessDiscoveryReport(
+            mode="DISCOVER",
+            principal_query=principal,
+            target_resource=None,
+            entries=all_entries,
+            principals_found=principals_found,
+        )
+        return report
+
+    async def check(self, principal: str, resource: str) -> "AccessDiscoveryReport":
+        """
+        Mode 2: Does this principal have access to this specific resource?
+        Lists direct + inherited role assignments that cover the resource.
+
+        Production wire-up:
+            assignments = auth_client.role_assignments.list_for_resource(
+                resource_group_name, resource_provider_namespace,
+                parent_resource_path, resource_type, resource_name,
+                filter=f"principalId eq '{object_id}'"
+            )
+        """
+        console.print(f"\n[cyan]ACCESS CHECK — principal: [bold]{principal}[/bold][/cyan]")
+        console.print(f"[cyan]Target resource: [bold]{resource}[/bold][/cyan]")
+        tenant = _mock_tenant()
+        all_assignments = self._get_all_assignments(tenant)
+
+        principals_found = self._find_principals(principal, tenant)
+        if not principals_found:
+            console.print(f"[red]No principal found matching '{principal}'[/red]")
+            return AccessDiscoveryReport(
+                mode="CHECK", principal_query=principal, target_resource=resource
+            )
+
+        all_entries = []
+        for p in principals_found:
+            console.print(f"  [green]Found:[/green] {p['display_name']} ({p['type']})")
+            all_entries += self._build_entries(p, all_assignments, resource_filter=resource)
+
+        report = AccessDiscoveryReport(
+            mode="CHECK",
+            principal_query=principal,
+            target_resource=resource,
+            entries=all_entries,
+            principals_found=principals_found,
+        )
+        return report
+
+    # ── print helpers ────────────────────────────────────────────────────────
+
+    def print_discover_report(self, report: AccessDiscoveryReport):
+        if not report.entries:
+            console.print("[yellow]No access found for this principal.[/yellow]")
+            return
+
+        # 1. Full access table
+        console.print(report.summary_table())
+
+        # 2. Scope tree
+        console.print()
+        rprint(report.scope_tree())
+
+        # 3. High-risk
+        if report.risky_entries():
+            console.print()
+            console.print(report.risk_table())
+
+        # 4. Stats
+        console.print()
+        by_st = report.by_scope_type()
+        by_rt = report.by_resource_type()
+        console.print(f"[bold]Stats:[/bold] "
+                      f"{len(report.entries)} total access entries  |  "
+                      f"{len(report.risky_entries())} high-risk  |  "
+                      f"{len(by_rt)} distinct resource types  |  "
+                      f"{len(by_st)} scope levels")
+
+    def print_check_report(self, report: AccessDiscoveryReport):
+        if not report.entries:
+            console.print(
+                f"\n[bold red]❌ NO ACCESS[/bold red] — "
+                f"'{report.principal_query}' has no role assignment covering:\n"
+                f"  {report.target_resource}"
+            )
+            return
+
+        console.print(f"\n[bold green]✅ ACCESS CONFIRMED[/bold green] — "
+                      f"{len(report.entries)} role assignment(s) cover this resource:\n")
+        console.print(report.summary_table())
+
+        if report.risky_entries():
+            console.print()
+            console.print(report.risk_table())
+
+    async def run_and_print(self, mode: str = "discover",
+                            principal: str = "spn-platform-governance",
+                            resource: str = ""):
+        if mode == "discover":
+            report = await self.discover(principal)
+            self.print_discover_report(report)
+        else:
+            report = await self.check(principal, resource)
+            self.print_check_report(report)
+        return report
+
+    # ── GRANT ────────────────────────────────────────────────────────────────
+
+    async def grant(
+        self,
+        principal: str,
+        role: str,
+        resource: str,
+        granted_by: str = "platform-governance-tool",
+        dry_run: bool = False,
+        confirm_high_risk: bool = False,
+    ) -> GrantResult:
+        """
+        Grant a role to a User / SPN / ACL on a specific Azure resource scope.
+
+        Safety gates (all run before any write):
+          1. Principal resolution   — must exist in directory
+          2. Role validation        — must be a known built-in role
+          3. Scope inference        — derive scope_type and resource_type from path
+          4. Duplicate detection    — no-op if assignment already exists
+          5. High-risk role guard   — Owner / UAA blocked unless confirm_high_risk=True
+          6. Broad-scope warning    — subscription/management-group scope flagged
+          7. Caller auth check      — granted_by must have Owner or UAA on that scope
+          8. Dry-run short-circuit  — prints plan, writes nothing
+
+        Production wire-up (replace the mock block below):
+            import uuid as _uuid
+            from azure.identity import DefaultAzureCredential
+            from azure.mgmt.authorization import AuthorizationManagementClient
+            from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
+
+            credential  = DefaultAzureCredential()
+            auth_client = AuthorizationManagementClient(credential, subscription_id)
+
+            role_def_id = (
+                f"/subscriptions/{subscription_id}/providers/Microsoft.Authorization"
+                f"/roleDefinitions/{AZURE_BUILTIN_ROLES[role]['id']}"
+            )
+            params = RoleAssignmentCreateParameters(
+                role_definition_id=role_def_id,
+                principal_id=principal_object_id,
+                principal_type=principal_type,   # "ServicePrincipal" | "Group" | "User"
+            )
+            result = auth_client.role_assignments.create(
+                scope=resource,
+                role_assignment_name=str(_uuid.uuid4()),
+                parameters=params,
+            )
+            assignment_id = result.id
+
+        Args:
+            principal:          Display name, Object ID, or App ID
+            role:               Azure built-in role name (e.g. "Contributor")
+            resource:           Full Azure resource path or subscription/RG scope
+            granted_by:         Identity performing the grant (for audit trail)
+            dry_run:            If True, validate and print plan but do NOT write
+            confirm_high_risk:  Required True for Owner / User Access Administrator
+        """
+        console.print(f"\n[cyan]ACCESS GRANT — principal: [bold]{principal}[/bold][/cyan]")
+        console.print(f"  Role:     [yellow]{role}[/yellow]")
+        console.print(f"  Scope:    {resource}")
+        console.print(f"  Dry-run:  {'[yellow]YES — no changes will be made[/yellow]' if dry_run else '[green]NO — will write[/green]'}")
+
+        tenant = _mock_tenant()
+        all_assignments = self._get_all_assignments(tenant)
+        warnings, errors = [], []
+
+        # ── 1. Resolve principal ─────────────────────────────────────────────
+        matches = self._find_principals(principal, tenant)
+        if not matches:
+            return GrantResult(
+                operation="GRANT", status="NOT_FOUND",
+                principal_name=principal, principal_type="Unknown",
+                principal_id="", role=role, role_level="",
+                scope=resource, scope_type="", resource_type="",
+                granted_by=granted_by, dry_run=dry_run,
+                errors=[f"No principal found matching '{principal}'"],
+            )
+        p = matches[0]   # Use first match (most specific)
+        console.print(f"  [green]Principal resolved:[/green] {p['display_name']} ({p['type']})")
+
+        # ── 2. Validate role ─────────────────────────────────────────────────
+        if role not in AZURE_BUILTIN_ROLES:
+            similar = [r for r in AZURE_BUILTIN_ROLES if principal.lower() in r.lower()]
+            hint = f" Did you mean: {similar[0]}?" if similar else ""
+            hint = f"\n  Available roles: {', '.join(list(AZURE_BUILTIN_ROLES.keys())[:8])}…"
+            return GrantResult(
+                operation="GRANT", status="BLOCKED",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level="",
+                scope=resource, scope_type="", resource_type="",
+                granted_by=granted_by, dry_run=dry_run,
+                errors=[f"Unknown role '{role}'.{hint}"],
+            )
+        role_meta  = AZURE_BUILTIN_ROLES[role]
+        role_level = role_meta["level"]
+        can_assign = role_meta["can_assign_roles"]
+
+        # ── 3. Infer scope type and resource type from path ──────────────────
+        scope_type, resource_type = self._infer_scope(resource)
+
+        # ── 4. Duplicate detection ───────────────────────────────────────────
+        for a in all_assignments:
+            if (a["principal_id"] == p["object_id"]
+                    and a["role"] == role
+                    and a["scope"].lower() == resource.lower()
+                    and not a.get("inherited", False)):
+                console.print(f"  [yellow]⚠  DUPLICATE — assignment already exists, nothing to do.[/yellow]")
+                return GrantResult(
+                    operation="GRANT", status="DUPLICATE",
+                    principal_name=p["display_name"], principal_type=p["type"],
+                    principal_id=p["object_id"], role=role, role_level=role_level,
+                    scope=resource, scope_type=scope_type, resource_type=resource_type,
+                    granted_by=granted_by, dry_run=dry_run,
+                    warnings=[f"{p['display_name']} already has '{role}' on this scope."],
+                )
+
+        # ── 5. High-risk role guard ──────────────────────────────────────────
+        if role in HIGH_RISK_ROLES and not confirm_high_risk:
+            msg = (
+                f"Role '{role}' is HIGH RISK (grants role-assignment rights). "
+                f"Pass --confirm to proceed."
+            )
+            console.print(f"  [bold red]🚫 BLOCKED — {msg}[/bold red]")
+            return GrantResult(
+                operation="GRANT", status="BLOCKED",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=granted_by, dry_run=dry_run,
+                errors=[msg],
+            )
+
+        # ── 6. Broad-scope warning ───────────────────────────────────────────
+        parts = resource.strip("/").split("/")
+        if scope_type in ("Subscription", "ManagementGroup"):
+            warnings.append(
+                f"Broad scope — '{role}' at {scope_type} level affects ALL resources underneath."
+            )
+        if role_level == "FULL" and scope_type in ("Subscription", "ManagementGroup"):
+            warnings.append("FULL control at subscription scope — review with security team before confirming.")
+        if can_assign:
+            warnings.append(f"'{role}' can grant further roles to others (privilege escalation risk).")
+
+        # ── 7. Caller authorization check (simulated) ────────────────────────
+        caller_has_rights = self._check_caller_can_grant(granted_by, resource, tenant)
+        if not caller_has_rights:
+            msg = f"Caller '{granted_by}' does not have Owner or User Access Administrator on this scope."
+            console.print(f"  [bold red]🚫 BLOCKED — {msg}[/bold red]")
+            return GrantResult(
+                operation="GRANT", status="BLOCKED",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=granted_by, dry_run=dry_run,
+                errors=[msg],
+            )
+
+        # ── 8. Dry-run short-circuit ─────────────────────────────────────────
+        if dry_run:
+            result = GrantResult(
+                operation="GRANT", status="DRY_RUN",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=granted_by, dry_run=True,
+                assignment_id="(not created — dry run)",
+                warnings=warnings,
+            )
+            self.print_grant_result(result)
+            return result
+
+        # ── 9. Execute grant ─────────────────────────────────────────────────
+        # PoC: write to in-memory mock + audit log
+        # Production: call AuthorizationManagementClient.role_assignments.create()
+        assignment_id = f"/subscriptions/{parts[1] if len(parts) > 1 else 'mock'}" \
+                        f"/providers/Microsoft.Authorization/roleAssignments/{uuid.uuid4()}"
+
+        new_assignment = {
+            "principal_id":   p["object_id"],
+            "role":           role,
+            "scope":          resource,
+            "scope_type":     scope_type,
+            "subscription":   parts[1] if len(parts) > 1 else "unknown",
+            "resource_group": parts[3] if len(parts) > 3 else "",
+            "resource_type":  resource_type,
+            "inherited":      False,
+        }
+        tenant["role_assignments"].append(new_assignment)
+
+        result = GrantResult(
+            operation="GRANT", status="SUCCESS",
+            principal_name=p["display_name"], principal_type=p["type"],
+            principal_id=p["object_id"], role=role, role_level=role_level,
+            scope=resource, scope_type=scope_type, resource_type=resource_type,
+            granted_by=granted_by, dry_run=False,
+            assignment_id=assignment_id,
+            warnings=warnings,
+        )
+
+        # Audit log
+        _append_grant_log(result.to_dict())
+        console.print(f"  [green]Assignment ID:[/green] {assignment_id}")
+
+        self.print_grant_result(result)
+        return result
+
+    # ── REVOKE ───────────────────────────────────────────────────────────────
+
+    async def revoke(
+        self,
+        principal: str,
+        role: str,
+        resource: str,
+        revoked_by: str = "platform-governance-tool",
+        dry_run: bool = False,
+    ) -> GrantResult:
+        """
+        Revoke a role from a User / SPN / ACL on a specific Azure resource scope.
+
+        Safety gates:
+          1. Principal resolution
+          2. Role validation
+          3. Assignment existence check — no-op if not assigned
+          4. Inherited assignment guard — cannot revoke inherited assignments directly
+          5. Caller auth check
+          6. Dry-run short-circuit
+
+        Production wire-up:
+            # First find the assignment ID
+            assignments = list(auth_client.role_assignments.list_for_scope(
+                scope=resource,
+                filter=f"principalId eq '{object_id}' and roleDefinitionId eq '{role_def_id}'"
+            ))
+            if assignments:
+                auth_client.role_assignments.delete_by_id(assignments[0].id)
+        """
+        console.print(f"\n[cyan]ACCESS REVOKE — principal: [bold]{principal}[/bold][/cyan]")
+        console.print(f"  Role:     [yellow]{role}[/yellow]")
+        console.print(f"  Scope:    {resource}")
+        console.print(f"  Dry-run:  {'[yellow]YES[/yellow]' if dry_run else '[green]NO[/green]'}")
+
+        tenant = _mock_tenant()
+        all_assignments = self._get_all_assignments(tenant)
+        warnings = []
+
+        # ── 1. Resolve principal ─────────────────────────────────────────────
+        matches = self._find_principals(principal, tenant)
+        if not matches:
+            return GrantResult(
+                operation="REVOKE", status="NOT_FOUND",
+                principal_name=principal, principal_type="Unknown",
+                principal_id="", role=role, role_level="",
+                scope=resource, scope_type="", resource_type="",
+                granted_by=revoked_by, dry_run=dry_run,
+                errors=[f"No principal found matching '{principal}'"],
+            )
+        p = matches[0]
+        console.print(f"  [green]Principal resolved:[/green] {p['display_name']} ({p['type']})")
+
+        # ── 2. Role validation ───────────────────────────────────────────────
+        if role not in AZURE_BUILTIN_ROLES:
+            return GrantResult(
+                operation="REVOKE", status="BLOCKED",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level="",
+                scope=resource, scope_type="", resource_type="",
+                granted_by=revoked_by, dry_run=dry_run,
+                errors=[f"Unknown role '{role}'."],
+            )
+        role_meta  = AZURE_BUILTIN_ROLES[role]
+        role_level = role_meta["level"]
+        scope_type, resource_type = self._infer_scope(resource)
+
+        # ── 3. Find direct assignment ────────────────────────────────────────
+        direct_match = None
+        inherited_match = None
+        for a in all_assignments:
+            if (a["principal_id"] == p["object_id"]
+                    and a["role"] == role
+                    and a["scope"].lower() == resource.lower()):
+                if a.get("inherited", False):
+                    inherited_match = a
+                else:
+                    direct_match = a
+                break
+
+        if not direct_match and not inherited_match:
+            console.print(f"  [yellow]⚠  NOT FOUND — no '{role}' assignment on this scope.[/yellow]")
+            return GrantResult(
+                operation="REVOKE", status="NOT_FOUND",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=revoked_by, dry_run=dry_run,
+                errors=[f"No '{role}' assignment found for '{p['display_name']}' on this exact scope."],
+            )
+
+        # ── 4. Inherited guard ───────────────────────────────────────────────
+        if inherited_match and not direct_match:
+            parent_scope = "/".join(resource.split("/")[:resource.lower().split("/").index("resourcegroups") + 2]) \
+                           if "resourcegroups" in resource.lower() \
+                           else "/subscriptions/" + resource.strip("/").split("/")[1]
+            return GrantResult(
+                operation="REVOKE", status="BLOCKED",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=revoked_by, dry_run=dry_run,
+                errors=[
+                    f"Assignment is INHERITED from a parent scope — cannot revoke at this level. "
+                    f"Revoke at the parent scope instead: {parent_scope}"
+                ],
+            )
+
+        # ── 5. Caller auth check ─────────────────────────────────────────────
+        caller_has_rights = self._check_caller_can_grant(revoked_by, resource, tenant)
+        if not caller_has_rights:
+            msg = f"Caller '{revoked_by}' does not have Owner or User Access Administrator on this scope."
+            return GrantResult(
+                operation="REVOKE", status="BLOCKED",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=revoked_by, dry_run=dry_run,
+                errors=[msg],
+            )
+
+        # ── 6. Dry-run ───────────────────────────────────────────────────────
+        if dry_run:
+            result = GrantResult(
+                operation="REVOKE", status="DRY_RUN",
+                principal_name=p["display_name"], principal_type=p["type"],
+                principal_id=p["object_id"], role=role, role_level=role_level,
+                scope=resource, scope_type=scope_type, resource_type=resource_type,
+                granted_by=revoked_by, dry_run=True,
+                assignment_id="(would be deleted)",
+                warnings=warnings,
+            )
+            self.print_grant_result(result)
+            return result
+
+        # ── 7. Execute revoke ────────────────────────────────────────────────
+        # PoC: remove from mock assignments list + audit log
+        # Production: auth_client.role_assignments.delete_by_id(assignment_id)
+        tenant["role_assignments"] = [
+            a for a in tenant["role_assignments"]
+            if not (a["principal_id"] == p["object_id"]
+                    and a["role"] == role
+                    and a["scope"].lower() == resource.lower()
+                    and not a.get("inherited", False))
+        ]
+
+        result = GrantResult(
+            operation="REVOKE", status="SUCCESS",
+            principal_name=p["display_name"], principal_type=p["type"],
+            principal_id=p["object_id"], role=role, role_level=role_level,
+            scope=resource, scope_type=scope_type, resource_type=resource_type,
+            granted_by=revoked_by, dry_run=False,
+            assignment_id="(deleted)",
+            warnings=warnings,
+        )
+        _append_grant_log(result.to_dict())
+        self.print_grant_result(result)
+        return result
+
+    # ── helpers for grant/revoke ─────────────────────────────────────────────
+
+    def _infer_scope(self, resource_path: str) -> tuple[str, str]:
+        """Derive scope_type and resource_type from a resource path."""
+        parts = [p for p in resource_path.strip("/").split("/") if p]
+        n = len(parts)
+        if n == 0:
+            return "Unknown", "Unknown"
+        if parts[0].lower() == "providers" and "managementgroups" in parts[1].lower():
+            return "ManagementGroup", "Microsoft.Management/managementGroups"
+        if n <= 2:   # /subscriptions/<id>
+            return "Subscription", "Microsoft.Management/subscriptions"
+        if n <= 4:   # /subscriptions/<id>/resourceGroups/<rg>
+            return "ResourceGroup", "Microsoft.Resources/resourceGroups"
+        if "providers" in [p.lower() for p in parts]:
+            pi = [p.lower() for p in parts].index("providers")
+            if pi + 2 < n:
+                ns   = parts[pi + 1]
+                kind = parts[pi + 2]
+                # Child resource: more path segments after the resource name
+                if pi + 4 < n:
+                    child_kind = parts[pi + 4]
+                    return "ChildResource", f"{ns}/{kind}/{child_kind}"
+                return "Resource", f"{ns}/{kind}"
+        return "Resource", "Unknown"
+
+    def _check_caller_can_grant(self, caller: str, scope: str, tenant: dict) -> bool:
+        """
+        Verify the caller (granted_by) has Owner or UAA on the target scope
+        or any parent scope.
+        Production: auth_client.role_assignments.list(filter=f"principalId eq '{caller_oid}'"")
+        PoC: the tool itself is always authorized (returns True) —
+             replace with real check when wiring Azure SDK.
+        """
+        # In PoC the governance tool is always the caller and always authorized.
+        # Swap this for a real lookup in production.
+        return True
+
+    def print_grant_result(self, result: GrantResult):
+        status_styles = {
+            "SUCCESS":   ("[bold green]✅ SUCCESS[/bold green]",   "green"),
+            "DRY_RUN":   ("[bold yellow]🔍 DRY RUN[/bold yellow]", "yellow"),
+            "DUPLICATE": ("[bold yellow]⚠  DUPLICATE[/bold yellow]","yellow"),
+            "BLOCKED":   ("[bold red]🚫 BLOCKED[/bold red]",       "red"),
+            "NOT_FOUND": ("[bold red]❌ NOT FOUND[/bold red]",      "red"),
+            "ERROR":     ("[bold red]💥 ERROR[/bold red]",          "red"),
+        }
+        label, color = status_styles.get(result.status, ("UNKNOWN", "white"))
+
+        op_verb = "Grant" if result.operation == "GRANT" else "Revoke"
+        lines = [
+            f"  Operation : {result.operation}",
+            f"  Status    : {label}",
+            f"  Principal : {result.principal_name} ({result.principal_type})",
+            f"  Role      : {result.role}  [{result.role_level}]",
+            f"  Scope     : {result.scope}",
+            f"  Scope type: {result.scope_type}",
+            f"  Res. type : {result.resource_type}",
+            f"  Performed : {result.granted_by}",
+            f"  Timestamp : {result.timestamp}",
+        ]
+        if result.assignment_id:
+            lines.append(f"  Assign ID : {result.assignment_id}")
+
+        for w in result.warnings:
+            lines.append(f"  [yellow]⚠  Warning : {w}[/yellow]")
+        for e in result.errors:
+            lines.append(f"  [red]✖  Error   : {e}[/red]")
+
+        console.print(Panel(
+            "\n".join(lines),
+            title=f"[bold]{op_verb} Result[/bold]",
+            border_style=color,
+            padding=(0, 1),
+        ))

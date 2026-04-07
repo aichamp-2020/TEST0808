@@ -1,0 +1,150 @@
+"""
+AI-Powered Compliance Report Agent
+Uses Anthropic Claude SDK to generate:
+- Executive summary of governance posture
+- Risk prioritization
+- Remediation recommendations
+- Audit-ready narrative
+"""
+
+import json
+from datetime import datetime
+from rich.console import Console
+from rich.panel import Panel
+import anthropic
+
+console = Console()
+
+
+class ComplianceReportAgent:
+    """
+    Sends governance findings to Claude and generates
+    an audit-ready compliance narrative.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        # Initialize Anthropic client
+        # GitHub Copilot will autocomplete client methods as you type
+        self.client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+
+    def _build_prompt(self, drift_report, rbac_report, onboard_report) -> str:
+        return f"""You are a Cloud Governance and Compliance Officer AI assistant.
+You have received the following automated governance scan results for:
+- Repository: {drift_report.repo}
+- Environment: {drift_report.env}
+- Scan Time: {datetime.utcnow().isoformat()} UTC
+
+=== INFRASTRUCTURE DRIFT REPORT ===
+Total Resources Scanned: {drift_report.total_resources_scanned}
+Drift Events Detected: {len(drift_report.drifts)}
+Critical Drifts: {drift_report.critical_count()}
+
+Drift Details:
+{json.dumps([
+    {
+        "resource": d.resource_id.split("/")[-1],
+        "type": d.resource_type.split("/")[-1],
+        "drift_type": d.drift_type,
+        "severity": d.severity,
+        "expected": d.expected_value,
+        "actual": d.actual_value,
+        "auto_revertible": d.auto_revertible,
+    }
+    for d in drift_report.drifts
+], indent=2)}
+
+=== RBAC ENFORCEMENT REPORT ===
+Principals Scanned: {rbac_report.total_principals_scanned}
+Violations Found: {len(rbac_report.violations)}
+
+Violations:
+{json.dumps([
+    {
+        "principal": v.principal,
+        "team": v.team,
+        "violation": v.violation_type,
+        "action": v.action,
+        "severity": v.severity,
+    }
+    for v in rbac_report.violations
+], indent=2)}
+
+=== ONBOARDING VALIDATION REPORT ===
+Can Onboard: {onboard_report.can_onboard()}
+Mandatory Gate Failures: {len(onboard_report.gate_failures())}
+
+Gate Failures:
+{json.dumps([
+    {
+        "check_id": r.check_id,
+        "category": r.category,
+        "check": r.check,
+        "detail": r.detail,
+    }
+    for r in onboard_report.gate_failures()
+], indent=2)}
+
+---
+
+Please produce a structured compliance report with:
+
+1. **EXECUTIVE SUMMARY** (3-4 sentences: overall posture, risk level HIGH/MEDIUM/LOW)
+2. **TOP 3 CRITICAL RISKS** (ranked by business impact with specific resource names)
+3. **IMMEDIATE ACTIONS REQUIRED** (step-by-step remediation for each critical finding)
+4. **ONBOARDING DECISION** (APPROVED / BLOCKED with clear reasoning)
+5. **30-DAY REMEDIATION ROADMAP** (prioritized action items with responsible team)
+6. **AUDIT TRAIL NOTE** (confirm all events are logged and traceable per compliance requirement)
+
+Use a professional tone. Be specific about resource names, principals, and actions.
+Format using markdown headers. This report will be shared with security advisors and leadership.
+"""
+
+    async def generate(self, drift_report, rbac_report, onboard_report) -> str:
+        """Send findings to Claude and return AI-generated compliance report."""
+        self.config.validate()
+
+        prompt = self._build_prompt(drift_report, rbac_report, onboard_report)
+
+        console.print("[cyan]Sending findings to Claude for AI analysis...[/cyan]")
+
+        # Anthropic SDK call — GitHub Copilot will assist with completions here
+        message = self.client.messages.create(
+            model=self.config.claude_model,
+            max_tokens=2048,
+            system=(
+                "You are an enterprise cloud governance and compliance expert. "
+                "You produce audit-ready reports for financial services organizations "
+                "aligned with Azure Security Center, RBAC best practices, and "
+                "infrastructure-as-code governance standards."
+            ),
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+        )
+
+        report_text = message.content[0].text
+
+        panel = Panel(
+            report_text,
+            title="[bold green]AI Compliance Report (Claude)[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+        console.print(panel)
+        return report_text
+
+    def export_to_json(self, drift_report, rbac_report, onboard_report, ai_report: str):
+        """Export all reports as a single audit-ready JSON artifact."""
+        output = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "drift_report": drift_report.to_dict(),
+            "rbac_report": rbac_report.to_dict(),
+            "onboarding_report": onboard_report.to_dict(),
+            "ai_compliance_narrative": ai_report,
+        }
+        with open("governance_report.json", "w") as f:
+            json.dump(output, f, indent=2)
+
+    async def run_and_print(self):
+        console.print("[yellow]Run 'full' mode to generate AI report with all findings.[/yellow]")

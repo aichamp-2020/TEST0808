@@ -1,0 +1,262 @@
+"""
+Drift Detection Agent
+Compares: Azure Portal State vs Terraform State vs Approved Code
+Goal: "Code is the source of truth"
+"""
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+
+@dataclass
+class DriftItem:
+    resource_id: str
+    resource_type: str
+    expected_value: Any        # Terraform/approved state
+    actual_value: Any          # Azure Portal live state
+    drift_type: str            # MISSING | MODIFIED | UNAUTHORIZED
+    severity: str              # HIGH | MEDIUM | LOW
+    auto_revertible: bool = True
+
+
+@dataclass
+class DriftReport:
+    repo: str
+    env: str
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    drifts: list[DriftItem] = field(default_factory=list)
+    total_resources_scanned: int = 0
+
+    def has_drift(self) -> bool:
+        return len(self.drifts) > 0
+
+    def critical_count(self) -> int:
+        return sum(1 for d in self.drifts if d.severity == "HIGH")
+
+    def summary(self) -> Table:
+        table = Table(title=f"Drift Report — {self.repo} ({self.env})", show_lines=True)
+        table.add_column("Resource ID", style="cyan")
+        table.add_column("Type")
+        table.add_column("Drift Type", style="yellow")
+        table.add_column("Severity", style="red")
+        table.add_column("Expected")
+        table.add_column("Actual")
+        table.add_column("Auto-Revert")
+
+        for d in self.drifts:
+            sev_color = "red" if d.severity == "HIGH" else "yellow" if d.severity == "MEDIUM" else "green"
+            table.add_row(
+                d.resource_id,
+                d.resource_type,
+                d.drift_type,
+                f"[{sev_color}]{d.severity}[/{sev_color}]",
+                str(d.expected_value),
+                str(d.actual_value),
+                "✅" if d.auto_revertible else "❌",
+            )
+
+        if not self.drifts:
+            table.add_row("[green]No drift detected[/green]", "", "", "", "", "", "")
+
+        return table
+
+    def to_dict(self) -> dict:
+        return {
+            "repo": self.repo,
+            "env": self.env,
+            "timestamp": self.timestamp,
+            "total_resources_scanned": self.total_resources_scanned,
+            "drift_count": len(self.drifts),
+            "critical_count": self.critical_count(),
+            "drifts": [
+                {
+                    "resource_id": d.resource_id,
+                    "resource_type": d.resource_type,
+                    "expected_value": d.expected_value,
+                    "actual_value": d.actual_value,
+                    "drift_type": d.drift_type,
+                    "severity": d.severity,
+                    "auto_revertible": d.auto_revertible,
+                }
+                for d in self.drifts
+            ],
+        }
+
+
+class DriftDetectionAgent:
+    """
+    Detects infrastructure drift by comparing:
+    1. Approved Terraform state (source of truth)
+    2. Live Azure Portal state (actual deployed state)
+
+    In production: wire azure_mgmt_resource + terraform-local-exec calls.
+    PoC uses mock data to demonstrate the workflow.
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def _load_terraform_state(self) -> dict:
+        """Load expected state from Terraform state file."""
+        path = self.config.terraform_state_path
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        # Return mock state if file not found
+        return {
+            "resources": [
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Network/virtualNetworks/vnet-main",
+                    "type": "Microsoft.Network/virtualNetworks",
+                    "properties": {"addressSpace": "10.0.0.0/16", "tags": {"env": "dev", "managed_by": "terraform"}},
+                },
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Storage/storageAccounts/stgplatformpoc",
+                    "type": "Microsoft.Storage/storageAccounts",
+                    "properties": {"sku": "Standard_LRS", "httpsOnly": True, "tags": {"env": "dev", "managed_by": "terraform"}},
+                },
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.KeyVault/vaults/kv-platform-poc",
+                    "type": "Microsoft.KeyVault/vaults",
+                    "properties": {"softDeleteEnabled": True, "purgeProtection": True, "tags": {"env": "dev", "managed_by": "terraform"}},
+                },
+            ]
+        }
+
+    def _get_azure_live_state(self) -> dict:
+        """
+        Fetch live state from Azure.
+        Production: use azure.mgmt.resource.ResourceManagementClient
+        PoC: simulates drift by modifying some values.
+        """
+        # Simulate drift: storage account SKU changed manually,
+        # and an unauthorized resource was added via portal
+        return {
+            "resources": [
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Network/virtualNetworks/vnet-main",
+                    "type": "Microsoft.Network/virtualNetworks",
+                    "properties": {"addressSpace": "10.0.0.0/16", "tags": {"env": "dev", "managed_by": "terraform"}},
+                },
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Storage/storageAccounts/stgplatformpoc",
+                    "type": "Microsoft.Storage/storageAccounts",
+                    # DRIFT: SKU changed from Standard_LRS to Premium_LRS via portal
+                    "properties": {"sku": "Premium_LRS", "httpsOnly": True, "tags": {"env": "dev", "managed_by": "terraform"}},
+                },
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.KeyVault/vaults/kv-platform-poc",
+                    "type": "Microsoft.KeyVault/vaults",
+                    # DRIFT: purgeProtection disabled manually
+                    "properties": {"softDeleteEnabled": True, "purgeProtection": False, "tags": {"env": "dev", "managed_by": "terraform"}},
+                },
+                # UNAUTHORIZED: resource not in Terraform state
+                {
+                    "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Compute/virtualMachines/vm-rogue-001",
+                    "type": "Microsoft.Compute/virtualMachines",
+                    "properties": {"vmSize": "Standard_D4s_v3", "tags": {}},
+                },
+            ]
+        }
+
+    def _compare_states(
+        self, terraform_state: dict, azure_state: dict
+    ) -> list[DriftItem]:
+        """Compare states and return list of drift items."""
+        drifts = []
+        tf_resources = {r["id"]: r for r in terraform_state["resources"]}
+        az_resources = {r["id"]: r for r in azure_state["resources"]}
+
+        # Check for MODIFIED or MISSING resources
+        for rid, tf_res in tf_resources.items():
+            if rid not in az_resources:
+                drifts.append(DriftItem(
+                    resource_id=rid,
+                    resource_type=tf_res["type"],
+                    expected_value=tf_res["properties"],
+                    actual_value="MISSING",
+                    drift_type="MISSING",
+                    severity="HIGH",
+                ))
+            else:
+                az_res = az_resources[rid]
+                tf_props = tf_res["properties"]
+                az_props = az_res["properties"]
+                if tf_props != az_props:
+                    # Find which property differs
+                    diffs = {
+                        k: {"expected": tf_props.get(k), "actual": az_props.get(k)}
+                        for k in set(tf_props) | set(az_props)
+                        if tf_props.get(k) != az_props.get(k)
+                    }
+                    severity = "HIGH" if tf_res["type"] in [
+                        "Microsoft.KeyVault/vaults",
+                        "Microsoft.Security/securityContacts",
+                    ] else "MEDIUM"
+                    drifts.append(DriftItem(
+                        resource_id=rid,
+                        resource_type=tf_res["type"],
+                        expected_value=str(diffs),
+                        actual_value=str(az_props),
+                        drift_type="MODIFIED",
+                        severity=severity,
+                    ))
+
+        # Check for UNAUTHORIZED resources (in Azure but not in Terraform)
+        for rid, az_res in az_resources.items():
+            if rid not in tf_resources:
+                drifts.append(DriftItem(
+                    resource_id=rid,
+                    resource_type=az_res["type"],
+                    expected_value="NOT IN TERRAFORM STATE",
+                    actual_value=str(az_res["properties"]),
+                    drift_type="UNAUTHORIZED",
+                    severity="HIGH",
+                    auto_revertible=False,
+                ))
+
+        return drifts
+
+    def _revert_drift(self, drift: DriftItem):
+        """
+        Trigger Terraform plan + apply to revert drift.
+        Production: subprocess.run(["terraform", "apply", "-auto-approve", "-target", drift.resource_id])
+        PoC: logs the action.
+        """
+        console.print(
+            f"  [bold red]AUTO-REVERT[/bold red] → {drift.resource_id} "
+            f"(would run: terraform apply -target={drift.resource_id})"
+        )
+
+    async def run(self) -> DriftReport:
+        console.print(f"[cyan]Scanning: {self.config.repo} [{self.config.env}][/cyan]")
+
+        tf_state = self._load_terraform_state()
+        az_state = self._get_azure_live_state()
+
+        drifts = self._compare_states(tf_state, az_state)
+
+        report = DriftReport(
+            repo=self.config.repo,
+            env=self.config.env,
+            drifts=drifts,
+            total_resources_scanned=len(tf_state["resources"]),
+        )
+
+        if self.config.auto_revert:
+            for drift in drifts:
+                if drift.auto_revertible:
+                    self._revert_drift(drift)
+
+        return report
+
+    async def run_and_print(self):
+        report = await self.run()
+        console.print(report.summary())

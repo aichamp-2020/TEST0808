@@ -1,0 +1,162 @@
+"""
+Onboarding Validator Agent
+Validates repo onboarding against platform checklist:
+- Pre-onboarding validation
+- Prism configuration verification
+- Mandatory compliance gates
+- Security configuration validation
+"""
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from rich.table import Table
+from rich.console import Console
+
+console = Console()
+
+# Standardized platform checklist (Section 3.5 of BRD)
+PLATFORM_CHECKLIST = [
+    # PRE-ONBOARDING
+    {"id": "PRE-001", "category": "Pre-Onboarding", "check": "Repo registered in Cloud Catalog (v3/v4)", "gate": True},
+    {"id": "PRE-002", "category": "Pre-Onboarding", "check": "Terraform state backend configured (Azure Blob)", "gate": True},
+    {"id": "PRE-003", "category": "Pre-Onboarding", "check": "Business unit and domain tag present", "gate": True},
+    {"id": "PRE-004", "category": "Pre-Onboarding", "check": "Pipeline (CI/CD) uses approved Terraform version", "gate": True},
+    # PRISM
+    {"id": "PRM-001", "category": "Prism Config", "check": "Prism agent installed and reporting", "gate": True},
+    {"id": "PRM-002", "category": "Prism Config", "check": "Log analytics workspace connected", "gate": False},
+    {"id": "PRM-003", "category": "Prism Config", "check": "KRI dashboards linked to Prism", "gate": False},
+    # COMPLIANCE GATES
+    {"id": "CMP-001", "category": "Compliance Gate", "check": "No Owner/UAA roles on subscription scope", "gate": True},
+    {"id": "CMP-002", "category": "Compliance Gate", "check": "Azure Security Center standard tier enabled", "gate": True},
+    {"id": "CMP-003", "category": "Compliance Gate", "check": "Drift detection workflow active", "gate": True},
+    {"id": "CMP-004", "category": "Compliance Gate", "check": "Compliance evidence stored (audit-ready)", "gate": False},
+    # SECURITY
+    {"id": "SEC-001", "category": "Security Config", "check": "Key Vault soft-delete and purge-protection enabled", "gate": True},
+    {"id": "SEC-002", "category": "Security Config", "check": "Storage accounts HTTPS-only", "gate": True},
+    {"id": "SEC-003", "category": "Security Config", "check": "Network security groups attached to subnets", "gate": False},
+    {"id": "SEC-004", "category": "Security Config", "check": "Azure Defender enabled for Storage & KeyVault", "gate": True},
+]
+
+
+@dataclass
+class CheckResult:
+    check_id: str
+    category: str
+    check: str
+    passed: bool
+    is_gate: bool
+    detail: str = ""
+
+
+@dataclass
+class OnboardingReport:
+    repo: str
+    env: str
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    results: list[CheckResult] = field(default_factory=list)
+
+    def gate_failures(self) -> list[CheckResult]:
+        return [r for r in self.results if r.is_gate and not r.passed]
+
+    def can_onboard(self) -> bool:
+        return len(self.gate_failures()) == 0
+
+    def summary(self) -> Table:
+        table = Table(title=f"Onboarding Checklist — {self.repo} ({self.env})", show_lines=True)
+        table.add_column("ID", style="cyan")
+        table.add_column("Category")
+        table.add_column("Check")
+        table.add_column("Status")
+        table.add_column("Gate?")
+        table.add_column("Detail")
+
+        for r in self.results:
+            status = "[green]✅ PASS[/green]" if r.passed else "[red]❌ FAIL[/red]"
+            gate = "[red]MANDATORY[/red]" if r.is_gate else "Optional"
+            table.add_row(r.check_id, r.category, r.check, status, gate, r.detail)
+
+        verdict = (
+            "[bold green]✅ ONBOARDING APPROVED[/bold green]"
+            if self.can_onboard()
+            else f"[bold red]❌ ONBOARDING BLOCKED — {len(self.gate_failures())} gate(s) failed[/bold red]"
+        )
+        table.caption = verdict
+        return table
+
+    def to_dict(self) -> dict:
+        return {
+            "repo": self.repo,
+            "env": self.env,
+            "timestamp": self.timestamp,
+            "can_onboard": self.can_onboard(),
+            "gate_failures": len(self.gate_failures()),
+            "results": [
+                {
+                    "check_id": r.check_id,
+                    "category": r.category,
+                    "check": r.check,
+                    "passed": r.passed,
+                    "is_gate": r.is_gate,
+                    "detail": r.detail,
+                }
+                for r in self.results
+            ],
+        }
+
+
+class OnboardingValidatorAgent:
+    """
+    Validates a repository against the platform onboarding checklist.
+    Each mandatory gate must pass before onboarding is approved.
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def _run_checks(self) -> list[CheckResult]:
+        """
+        Production: Integrate with Azure Resource Graph, Security Center API,
+        Terraform state backend, and Prism APIs.
+        PoC: Simulates results with intentional failures for demonstration.
+        """
+        results = []
+        # Simulate: most pass, a few fail
+        failures = {"PRM-001", "CMP-003", "SEC-004"}
+
+        for item in PLATFORM_CHECKLIST:
+            cid = item["id"]
+            passed = cid not in failures
+            detail = ""
+            if not passed:
+                if cid == "PRM-001":
+                    detail = "Prism agent not found in registry"
+                elif cid == "CMP-003":
+                    detail = "Drift detection pipeline not configured"
+                elif cid == "SEC-004":
+                    detail = "Azure Defender plan not enabled for this subscription"
+
+            results.append(CheckResult(
+                check_id=cid,
+                category=item["category"],
+                check=item["check"],
+                passed=passed,
+                is_gate=item["gate"],
+                detail=detail,
+            ))
+
+        return results
+
+    async def run(self) -> OnboardingReport:
+        console.print(f"[cyan]Validating onboarding: {self.config.repo} [{self.config.env}][/cyan]")
+        results = self._run_checks()
+        return OnboardingReport(
+            repo=self.config.repo,
+            env=self.config.env,
+            results=results,
+        )
+
+    async def run_and_print(self):
+        report = await self.run()
+        console.print(report.summary())

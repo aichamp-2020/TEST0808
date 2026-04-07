@@ -1,0 +1,198 @@
+"""
+RBAC Enforcement Agent
+Enforces: Resource-level RBAC | Least-privilege | Separation of Duties
+Teams: Platform | App | Security
+Aligns with: Azure Security Center recommendations
+"""
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from rich.table import Table
+from rich.console import Console
+
+console = Console()
+
+# Separation of Duties matrix — who can do what
+SEPARATION_OF_DUTIES = {
+    "platform_team": {
+        "allowed": ["terraform:apply", "platform:configure", "infra:provision"],
+        "denied":  ["app:deploy", "security:override", "data:read"],
+    },
+    "app_team": {
+        "allowed": ["app:deploy", "app:configure", "data:read"],
+        "denied":  ["terraform:apply", "infra:provision", "security:override"],
+    },
+    "security_team": {
+        "allowed": ["security:audit", "security:configure", "rbac:manage", "compliance:review"],
+        "denied":  ["app:deploy", "terraform:apply", "data:write"],
+    },
+}
+
+
+@dataclass
+class RBACViolation:
+    principal: str
+    team: str
+    action: str
+    resource: str
+    violation_type: str   # EXCESSIVE_PRIVILEGE | SOD_VIOLATION | MISSING_TAG
+    severity: str
+
+
+@dataclass
+class RBACReport:
+    repo: str
+    env: str
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    violations: list[RBACViolation] = field(default_factory=list)
+    total_principals_scanned: int = 0
+
+    def summary(self) -> Table:
+        table = Table(title=f"RBAC Enforcement — {self.repo} ({self.env})", show_lines=True)
+        table.add_column("Principal", style="cyan")
+        table.add_column("Team")
+        table.add_column("Action", style="yellow")
+        table.add_column("Resource")
+        table.add_column("Violation", style="red")
+        table.add_column("Severity")
+
+        for v in self.violations:
+            sev_color = "red" if v.severity == "HIGH" else "yellow"
+            table.add_row(
+                v.principal, v.team, v.action, v.resource,
+                v.violation_type, f"[{sev_color}]{v.severity}[/{sev_color}]"
+            )
+
+        if not self.violations:
+            table.add_row("[green]No RBAC violations[/green]", "", "", "", "", "")
+
+        return table
+
+    def to_dict(self) -> dict:
+        return {
+            "repo": self.repo,
+            "env": self.env,
+            "timestamp": self.timestamp,
+            "total_principals_scanned": self.total_principals_scanned,
+            "violation_count": len(self.violations),
+            "violations": [
+                {
+                    "principal": v.principal,
+                    "team": v.team,
+                    "action": v.action,
+                    "resource": v.resource,
+                    "violation_type": v.violation_type,
+                    "severity": v.severity,
+                }
+                for v in self.violations
+            ],
+        }
+
+
+class RBACEnforcementAgent:
+    """
+    Checks Azure role assignments against least-privilege policy
+    and separation-of-duties matrix.
+
+    Production: Use azure.mgmt.authorization.AuthorizationManagementClient
+    PoC: Uses mock role assignment data
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def _load_rbac_policy(self) -> dict:
+        path = self.config.rbac_policy_path
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        # Mock policy
+        return {
+            "allowed_roles": {
+                "platform_team": ["Contributor"],
+                "app_team": ["Reader", "App Deployer"],
+                "security_team": ["Security Admin"],
+            },
+            "forbidden_roles_on_prod": ["Owner", "User Access Administrator"],
+        }
+
+    def _get_azure_role_assignments(self) -> list[dict]:
+        """
+        Production: ResourceManagementClient.role_assignments.list()
+        PoC: Returns mock assignments with intentional violations
+        """
+        return [
+            # Valid
+            {"principal": "alice@company.com", "team": "platform_team",
+             "role": "Contributor", "scope": "/subscriptions/mock/resourceGroups/rg-platform-poc",
+             "actions": ["terraform:apply", "infra:provision"]},
+            # SOD Violation: app_team member doing terraform:apply
+            {"principal": "bob@company.com", "team": "app_team",
+             "role": "Contributor", "scope": "/subscriptions/mock/resourceGroups/rg-platform-poc",
+             "actions": ["app:deploy", "terraform:apply"]},  # terraform:apply is denied for app_team
+            # Excessive privilege: Owner on prod
+            {"principal": "charlie@company.com", "team": "security_team",
+             "role": "Owner", "scope": "/subscriptions/mock",
+             "actions": ["security:audit"]},
+            # Valid
+            {"principal": "diana@company.com", "team": "security_team",
+             "role": "Security Admin", "scope": "/subscriptions/mock/resourceGroups/rg-platform-poc",
+             "actions": ["security:audit", "rbac:manage"]},
+        ]
+
+    def _check_violations(self, assignments: list[dict], policy: dict) -> list[RBACViolation]:
+        violations = []
+        forbidden_prod = set(policy.get("forbidden_roles_on_prod", []))
+        sod = SEPARATION_OF_DUTIES
+
+        for assignment in assignments:
+            team = assignment["team"]
+            principal = assignment["principal"]
+            role = assignment["role"]
+            resource = assignment["scope"]
+            actions = assignment.get("actions", [])
+            team_sod = sod.get(team, {})
+
+            # Check SOD violations
+            for action in actions:
+                if action in team_sod.get("denied", []):
+                    violations.append(RBACViolation(
+                        principal=principal,
+                        team=team,
+                        action=action,
+                        resource=resource,
+                        violation_type="SOD_VIOLATION",
+                        severity="HIGH",
+                    ))
+
+            # Check excessive privilege
+            if role in forbidden_prod:
+                violations.append(RBACViolation(
+                    principal=principal,
+                    team=team,
+                    action=f"role:{role}",
+                    resource=resource,
+                    violation_type="EXCESSIVE_PRIVILEGE",
+                    severity="HIGH",
+                ))
+
+        return violations
+
+    async def run(self) -> RBACReport:
+        console.print(f"[cyan]Checking RBAC: {self.config.repo} [{self.config.env}][/cyan]")
+        policy = self._load_rbac_policy()
+        assignments = self._get_azure_role_assignments()
+        violations = self._check_violations(assignments, policy)
+
+        return RBACReport(
+            repo=self.config.repo,
+            env=self.config.env,
+            violations=violations,
+            total_principals_scanned=len(assignments),
+        )
+
+    async def run_and_print(self):
+        report = await self.run()
+        console.print(report.summary())
