@@ -1,1 +1,19 @@
+# Full check — all 4 agents + Claude report
+python main.py --mode full --repo insurance-repo --env dev
+
+# Individual agents
+python main.py --mode drift
+python main.py --mode rbac
+python main.py --mode onboard
+
+# Auto-revert drifted resources
+AUTO_REVERT=true python main.py --mode drift
+
+When you run python main.py --mode full, it executes 4 things in sequence:
+1 — Drift Detection scans your Azure live state against Terraform state and flags three types of issues: resources modified manually via the portal (e.g. someone changed a storage SKU), unauthorized resources deployed outside Terraform (rogue VMs), and resources that are in Terraform but missing from Azure. If AUTO_REVERT=true, it automatically runs terraform apply -target to revert each one.
+2 — RBAC Enforcement checks all role assignments against your separation-of-duties matrix — platform team, app team, security team each have explicit allowed/denied actions. It catches SOD violations (e.g. an app_team member running terraform commands) and excessive privilege (e.g. Owner role at subscription scope, which is blocked on prod).
+3 — Onboarding Validator runs 14 checks across 4 categories: pre-onboarding (Terraform backend, Cloud Catalog, tags), Prism configuration, compliance gates, and security config. Three are mandatory gates — if any fail, onboarding is blocked and the report says exactly why.
+4 — Claude Report takes all findings from agents 1–3 and sends them to Claude via the Anthropic SDK. Claude returns a structured, audit-ready narrative with an executive summary, top 3 risks by business impact, a step-by-step remediation plan per finding, an onboarding APPROVED/BLOCKED verdict, and a 30-day roadmap. All of this gets written to governance_report.json.
+The mock data in the PoC is pre-wired to show real failures so you can see the full output immediately — no Azure credentials needed to demo it.
+
 
