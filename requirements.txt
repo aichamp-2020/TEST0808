@@ -1,2 +1,14 @@
-flask==3.0.3
-gunicorn==22.0.0
+# Platform Governance PoC — Dependencies
+# Install: pip install -r requirements.txt
+
+# Anthropic Claude SDK
+anthropic>=0.40.0
+
+# Azure SDK (for production integration)
+azure-mgmt-resource>=23.0.0
+azure-mgmt-authorization>=4.0.0
+azure-identity>=1.15.0
+
+# Utilities
+python-dotenv>=1.0.0
+rich>=13.7.0          # Terminal output formatting

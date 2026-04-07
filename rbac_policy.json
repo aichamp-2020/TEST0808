@@ -1,0 +1,22 @@
+{
+  "allowed_roles": {
+    "platform_team": ["Contributor"],
+    "app_team": ["Reader", "App Deployer"],
+    "security_team": ["Security Admin"]
+  },
+  "forbidden_roles_on_prod": ["Owner", "User Access Administrator"],
+  "separation_of_duties": {
+    "platform_team": {
+      "allowed": ["terraform:apply", "platform:configure", "infra:provision"],
+      "denied": ["app:deploy", "security:override", "data:read"]
+    },
+    "app_team": {
+      "allowed": ["app:deploy", "app:configure", "data:read"],
+      "denied": ["terraform:apply", "infra:provision", "security:override"]
+    },
+    "security_team": {
+      "allowed": ["security:audit", "security:configure", "rbac:manage", "compliance:review"],
+      "denied": ["app:deploy", "terraform:apply", "data:write"]
+    }
+  }
+}

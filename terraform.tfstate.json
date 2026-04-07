@@ -1,0 +1,30 @@
+{
+  "resources": [
+    {
+      "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Network/virtualNetworks/vnet-main",
+      "type": "Microsoft.Network/virtualNetworks",
+      "properties": {
+        "addressSpace": "10.0.0.0/16",
+        "tags": { "env": "dev", "managed_by": "terraform" }
+      }
+    },
+    {
+      "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.Storage/storageAccounts/stgplatformpoc",
+      "type": "Microsoft.Storage/storageAccounts",
+      "properties": {
+        "sku": "Standard_LRS",
+        "httpsOnly": true,
+        "tags": { "env": "dev", "managed_by": "terraform" }
+      }
+    },
+    {
+      "id": "/subscriptions/mock/resourceGroups/rg-platform-poc/providers/Microsoft.KeyVault/vaults/kv-platform-poc",
+      "type": "Microsoft.KeyVault/vaults",
+      "properties": {
+        "softDeleteEnabled": true,
+        "purgeProtection": true,
+        "tags": { "env": "dev", "managed_by": "terraform" }
+      }
+    }
+  ]
+}

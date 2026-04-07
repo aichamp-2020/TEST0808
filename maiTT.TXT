@@ -1,0 +1,100 @@
+"""
+Platform Governance PoC - Main Entry Point
+Validates: Drift Detection | Reversion Workflow | Compliance Reporting | RBAC Enforcement
+Powered by: Anthropic Claude SDK + GitHub Copilot
+"""
+
+import asyncio
+import argparse
+from rich.console import Console
+from rich.panel import Panel
+
+from agents.drift_detector import DriftDetectionAgent
+from agents.compliance_reporter import ComplianceReportAgent
+from agents.rbac_enforcer import RBACEnforcementAgent
+from agents.onboarding_validator import OnboardingValidatorAgent
+from config import GovernanceConfig
+
+console = Console()
+
+
+async def run_full_governance_check(config: GovernanceConfig):
+    """Run all governance checks end-to-end."""
+    console.print(Panel.fit(
+        "[bold cyan]Platform Governance PoC[/bold cyan]\n"
+        "Cloud Compliance | Drift Detection | RBAC | Reporting",
+        border_style="cyan"
+    ))
+
+    # 1. Drift Detection
+    console.rule("[bold yellow]Step 1: Infrastructure Drift Detection[/bold yellow]")
+    drift_agent = DriftDetectionAgent(config)
+    drift_report = await drift_agent.run()
+    console.print(drift_report.summary())
+
+    # 2. RBAC Enforcement
+    console.rule("[bold yellow]Step 2: RBAC Enforcement Check[/bold yellow]")
+    rbac_agent = RBACEnforcementAgent(config)
+    rbac_report = await rbac_agent.run()
+    console.print(rbac_report.summary())
+
+    # 3. Onboarding Validation
+    console.rule("[bold yellow]Step 3: Onboarding Checklist Validation[/bold yellow]")
+    onboard_agent = OnboardingValidatorAgent(config)
+    onboard_report = await onboard_agent.run()
+    console.print(onboard_report.summary())
+
+    # 4. AI-Powered Compliance Report (Claude)
+    console.rule("[bold yellow]Step 4: AI Compliance Report (Claude)[/bold yellow]")
+    report_agent = ComplianceReportAgent(config)
+    final_report = await report_agent.generate(
+        drift_report=drift_report,
+        rbac_report=rbac_report,
+        onboard_report=onboard_report,
+    )
+    console.print(final_report)
+
+    # 5. Export
+    report_agent.export_to_json(
+        drift_report, rbac_report, onboard_report, final_report
+    )
+    console.print("\n[green]✅ Governance report exported to: governance_report.json[/green]")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Platform Governance PoC")
+    parser.add_argument(
+        "--mode",
+        choices=["full", "drift", "rbac", "onboard", "report"],
+        default="full",
+        help="Which governance check to run",
+    )
+    parser.add_argument(
+        "--repo",
+        default="insurance-repo",
+        help="Target repository/domain name",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["dev", "uat", "prod"],
+        default="dev",
+        help="Target environment",
+    )
+    args = parser.parse_args()
+
+    config = GovernanceConfig(repo=args.repo, env=args.env)
+
+    if args.mode == "full":
+        asyncio.run(run_full_governance_check(config))
+    elif args.mode == "drift":
+        asyncio.run(DriftDetectionAgent(config).run_and_print())
+    elif args.mode == "rbac":
+        asyncio.run(RBACEnforcementAgent(config).run_and_print())
+    elif args.mode == "onboard":
+        asyncio.run(OnboardingValidatorAgent(config).run_and_print())
+    elif args.mode == "report":
+        asyncio.run(ComplianceReportAgent(config).run_and_print())
+
+
+if __name__ == "__main__":
+    main()
