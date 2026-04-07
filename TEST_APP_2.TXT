@@ -17,3 +17,37 @@ When you run python main.py --mode full, it executes 4 things in sequence:
 The mock data in the PoC is pre-wired to show real failures so you can see the full output immediately — no Azure credentials needed to demo it.
 
 
+# Always dry-run first — see exactly what would happen
+python main.py --mode grant \
+  --principal spn-data-pipeline \
+  --role "Storage Blob Data Reader" \
+  --resource /subscriptions/sub-insurance-001/resourceGroups/rg-data \
+  --dry-run
+
+# Grant for real
+python main.py --mode grant \
+  --principal spn-data-pipeline \
+  --role "Storage Blob Data Reader" \
+  --resource /subscriptions/sub-insurance-001/resourceGroups/rg-data
+
+# High-risk roles (Owner / User Access Administrator) — blocked unless --confirm
+python main.py --mode grant \
+  --principal acl-platform-team \
+  --role Owner \
+  --resource /subscriptions/sub-insurance-001 \
+  --confirm --dry-run
+
+python main.py --mode revoke \
+  --principal spn-aks-cluster \
+  --role "Network Contributor" \
+  --resource /subscriptions/sub-insurance-001/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/vnet-main
+
+8 safety gates that run before any write:
+GateWhat it catchesPrincipal resolutionBlocks if SPN/ACL/User not found in directoryRole validationBlocks unknown role names, lists valid optionsScope inferenceAuto-detects Subscription / ResourceGroup / Resource / ChildResource from pathDuplicate detectionNo-op if exact assignment already exists — won't double-assignHigh-risk role guardOwner and User Access Administrator blocked unless --confirm is passedBroad-scope warningSubscription/Management Group scope triggers 3 layered warningsInherited assignment guardRevoke blocked if assignment is inherited — tells you the parent scope to target insteadCaller auth checkVerifies --granted-by identity has Owner/UAA rights (real SDK call in production)
+Every operation writes two output files:
+
+grant_<name>_<role>.json — the result of that specific operation
+grant_audit_log.json — cumulative append-only audit trail of every grant and revoke ever run, with principal, role, scope, who performed it, timestamp, and assignment ID — ready for audit review
+
+Two new modes added to access_discovery.py — grant and revoke
+
