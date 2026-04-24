@@ -1,0 +1,14 @@
+# Best option if your team has a proper SNOW group:
+TEAM_FILTER_STRATEGY=group
+TEAM_ASSIGNMENT_GROUP=Cloud Platform Engineering
+
+# If no formal group — list your people:
+TEAM_FILTER_STRATEGY=members
+TEAM_MEMBERS=alice@company.com,sunita@company.com
+
+# If your team owns specific apps (SafeAlign, AI-Gateway):
+TEAM_FILTER_STRATEGY=ci
+TEAM_CIS=SafeAlign,AI-Gateway,OpenShift-Cluster
+
+# Catch everything across all signals:
+TEAM_FILTER_STRATEGY=any
