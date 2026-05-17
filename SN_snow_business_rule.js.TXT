@@ -1,0 +1,138 @@
+/**
+ * ServiceNow Business Rule — "Trigger Jira on Assignment"
+ * =========================================================
+ * Table  : sc_request  (change to 'incident' or 'sc_task' as needed)
+ * When   : after  insert or update
+ * Runs   : Server-side (Script Only)
+ * Runs On: ALL rows that match the condition below
+ *
+ * Condition (set in the Business Rule "Condition" field — NOT in script):
+ *   current.assigned_to.changes() || current.assignment_group.changes()
+ *   AND current.assigned_to != ''
+ *
+ * SETUP STEPS IN SERVICENOW:
+ * ─────────────────────────────────────────────────────────────────────────
+ *  1. Go to System Definition → Business Rules → New
+ *  2. Name       : Trigger Jira Story on Assignment
+ *  3. Table      : Service Request [sc_request]  (or Incident [incident])
+ *  4. Active     : ✓ (checked)
+ *  5. Advanced   : ✓ (checked) — to enable the Script tab
+ *  6. When       : after
+ *  7. Insert     : ✓
+ *  8. Update     : ✓
+ *  9. Condition  :
+ *       (current.assigned_to.changes() || current.assignment_group.changes())
+ *       && !current.assigned_to.nil()
+ * 10. Script tab : paste this entire file's content into the Script field
+ * 11. Save the Business Rule
+ *
+ * OUTBOUND REST MESSAGE SETUP (required before the Business Rule works):
+ * ─────────────────────────────────────────────────────────────────────────
+ *  1. Go to System Web Services → Outbound → REST Messages → New
+ *  2. Name       : Jira Webhook Trigger
+ *  3. Endpoint   : https://your-webhook-host.com/webhook/snow-assigned
+ *                  (replace with your actual webhook server URL)
+ *  4. Auth type  : No authentication  (security is handled by X-Snow-Secret header)
+ *  5. Save the REST Message
+ *  6. Under HTTP Methods tab → New:
+ *       Method name  : triggerJira
+ *       HTTP method  : POST
+ *       Endpoint     : (leave blank — inherits from parent)
+ *  7. Under HTTP Request tab (inside the HTTP Method):
+ *       Add HTTP Headers:
+ *         Content-Type  : application/json
+ *         X-Snow-Secret : <paste the exact value of your WEBHOOK_SECRET env var>
+ *  8. Save the HTTP Method
+ */
+
+(function executeRule(current, previous) {
+
+    // ── Configuration ──────────────────────────────────────────────────────────
+    // These values must match your webhook server + Business Rule setup exactly.
+
+    var REST_MESSAGE_NAME   = "Jira Webhook Trigger";  // REST Message name from step 1 above
+    var REST_METHOD_NAME    = "triggerJira";            // HTTP Method name from step 6 above
+
+    // Optional: restrict to specific assignment groups.
+    // Leave as an empty array [] to trigger for ALL groups.
+    var ALLOWED_GROUPS = [
+        "Cloud Platform Engineering",
+        "AI Platform Team"
+        // add more group names here as needed
+    ];
+
+    // ── Guard: only fire when actually assigned ────────────────────────────────
+    if (current.assigned_to.nil()) {
+        gs.info("JIRA TRIGGER: skipped — no assigned_to on " + current.number);
+        return;
+    }
+
+    // ── Guard: group filter ────────────────────────────────────────────────────
+    if (ALLOWED_GROUPS.length > 0) {
+        var groupName = current.assignment_group.getDisplayValue();
+        var groupMatched = false;
+        for (var i = 0; i < ALLOWED_GROUPS.length; i++) {
+            if (groupName === ALLOWED_GROUPS[i]) {
+                groupMatched = true;
+                break;
+            }
+        }
+        if (!groupMatched) {
+            gs.info(
+                "JIRA TRIGGER: skipped — group '" + groupName +
+                "' not in ALLOWED_GROUPS for " + current.number
+            );
+            return;
+        }
+    }
+
+    // ── Build payload ──────────────────────────────────────────────────────────
+    // We send only identifying fields; the webhook server fetches the full
+    // record using its own credentialled ServiceNow API call.
+    // This keeps the Business Rule lightweight and avoids stale data issues.
+    var payload = {
+        "sys_id":        current.sys_id.toString(),
+        "table":         current.getTableName(),
+        "number":        current.number.toString(),
+        "event":         "assigned",
+        "triggered_by":  "business_rule",
+        "assigned_to":   current.assigned_to.getDisplayValue(),
+        "assignment_group": current.assignment_group.getDisplayValue(),
+        "timestamp":     new GlideDateTime().toString()
+    };
+
+    var payloadStr = JSON.stringify(payload);
+
+    // ── Fire Outbound REST call ────────────────────────────────────────────────
+    try {
+        var sm = new sn_ws.RESTMessageV2(REST_MESSAGE_NAME, REST_METHOD_NAME);
+        sm.setRequestBody(payloadStr);
+
+        // Override endpoint dynamically if needed (optional):
+        // sm.setEndpoint("https://your-webhook-host.com/webhook/snow-assigned");
+
+        var response     = sm.execute();
+        var statusCode   = response.getStatusCode();
+        var responseBody = response.getBody();
+
+        if (statusCode === 200) {
+            gs.info(
+                "JIRA TRIGGER: SUCCESS for " + current.number +
+                " | Response: " + responseBody
+            );
+        } else {
+            gs.warn(
+                "JIRA TRIGGER: Non-200 response for " + current.number +
+                " | Status: " + statusCode +
+                " | Body: " + responseBody
+            );
+        }
+
+    } catch (ex) {
+        gs.error(
+            "JIRA TRIGGER: REST call FAILED for " + current.number +
+            " | Error: " + ex.getMessage()
+        );
+    }
+
+})(current, previous);

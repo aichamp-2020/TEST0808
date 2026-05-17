@@ -1,14 +1,17 @@
-# Platform Governance PoC — Dependencies
+# ServiceNow → Jira Integration — Python Dependencies
 # Install: pip install -r requirements.txt
 
-# Anthropic Claude SDK
-anthropic>=0.40.0
+# Web framework + ASGI server (webhook listener)
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+gunicorn==22.0.0
 
-# Azure SDK (for production integration)
-azure-mgmt-resource>=23.0.0
-azure-mgmt-authorization>=4.0.0
-azure-identity>=1.15.0
+# HTTP client (both scripts)
+requests==2.31.0
 
-# Utilities
-python-dotenv>=1.0.0
-rich>=13.7.0          # Terminal output formatting
+# .env loader (both scripts)
+python-dotenv==1.0.1
+
+# Azure Key Vault + SPN auth (both scripts)
+azure-identity==1.16.0
+azure-keyvault-secrets==4.8.0

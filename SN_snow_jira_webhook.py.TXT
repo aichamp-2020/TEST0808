@@ -1,0 +1,520 @@
+"""
+ServiceNow → Jira  AUTO-TRIGGER Webhook Listener
+=================================================
+This service runs as a persistent HTTP endpoint.
+ServiceNow fires a Business Rule on every assignment event and POSTs the
+record payload here.  This listener validates, deduplicates, maps, creates
+the Jira issue, and writes the Jira URL back to the ServiceNow record.
+
+Architecture:
+    ServiceNow Record Assigned
+        → Business Rule fires (script at snow_business_rule.js)
+        → POST /webhook/snow-assigned  (this service)
+        → HMAC signature verified
+        → Duplicate check against Jira
+        → Reporter email resolved to Jira accountId / username
+        → Jira Story created
+        → ServiceNow record patched with Jira URL in work_notes
+        → 200 OK returned to ServiceNow
+
+Requirements:
+    pip install fastapi uvicorn requests python-dotenv
+
+Run:
+    uvicorn snow_jira_webhook:app --host 0.0.0.0 --port 8080
+
+    OR with gunicorn for production:
+    gunicorn snow_jira_webhook:app -w 2 -k uvicorn.workers.UvicornWorker \
+             --bind 0.0.0.0:8080
+
+Environment Variables (.env):
+    # ── ServiceNow ─────────────────────────────────────────────────────
+    SNOW_INSTANCE         = your-instance.service-now.com
+    SNOW_USER             = servicenow_api_user
+    SNOW_PASS             = servicenow_api_password
+
+    # ── Jira ───────────────────────────────────────────────────────────
+    JIRA_BASE_URL         = https://your-org.atlassian.net
+    JIRA_USER             = jira_email@company.com
+    JIRA_API_TOKEN        = your_jira_api_token
+    JIRA_PROJECT_KEY      = PROJ
+    JIRA_TYPE             = cloud        # cloud | server
+
+    # ── Webhook Security ───────────────────────────────────────────────
+    WEBHOOK_SECRET        = your_shared_secret_here
+    # ServiceNow Business Rule must send this same secret in
+    # the X-Snow-Secret header.
+
+    # ── Optional Filters ───────────────────────────────────────────────
+    # Only process records assigned to these groups (comma-separated).
+    # Leave blank to process ALL assignments regardless of group.
+    TEAM_ASSIGNMENT_GROUPS = Cloud Platform Engineering,AI Platform Team
+
+    # ── Writeback ──────────────────────────────────────────────────────
+    # Set to "true" to patch ServiceNow work_notes with the Jira URL.
+    SNOW_WRITEBACK        = true
+"""
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from typing import Optional
+
+import requests
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+
+load_dotenv()
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            f"webhook_{datetime.now().strftime('%Y%m%d')}.log"
+        ),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+class Config:
+    SNOW_INSTANCE  = os.getenv("SNOW_INSTANCE", "")
+    SNOW_BASE_URL  = f"https://{SNOW_INSTANCE}/api/now"
+    SNOW_USER      = os.getenv("SNOW_USER", "")
+    SNOW_PASS      = os.getenv("SNOW_PASS", "")
+
+    JIRA_BASE_URL  = os.getenv("JIRA_BASE_URL", "").rstrip("/")
+    JIRA_USER      = os.getenv("JIRA_USER", "")
+    JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
+    JIRA_PROJECT   = os.getenv("JIRA_PROJECT_KEY", "PROJ")
+    JIRA_TYPE      = os.getenv("JIRA_TYPE", "cloud").lower()
+
+    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+    TEAM_GROUPS = [
+        g.strip()
+        for g in os.getenv("TEAM_ASSIGNMENT_GROUPS", "").split(",")
+        if g.strip()
+    ]
+
+    SNOW_WRITEBACK = os.getenv("SNOW_WRITEBACK", "true").lower() == "true"
+
+    @classmethod
+    def validate(cls):
+        missing = [
+            k for k, v in {
+                "SNOW_INSTANCE":  cls.SNOW_INSTANCE,
+                "SNOW_USER":      cls.SNOW_USER,
+                "SNOW_PASS":      cls.SNOW_PASS,
+                "JIRA_BASE_URL":  cls.JIRA_BASE_URL,
+                "JIRA_USER":      cls.JIRA_USER,
+                "JIRA_API_TOKEN": cls.JIRA_API_TOKEN,
+                "WEBHOOK_SECRET": cls.WEBHOOK_SECRET,
+            }.items() if not v
+        ]
+        if missing:
+            raise EnvironmentError(
+                f"Missing required env vars: {', '.join(missing)}"
+            )
+        log.info(
+            f"[CONFIG] JIRA_TYPE={cls.JIRA_TYPE}  "
+            f"WRITEBACK={cls.SNOW_WRITEBACK}  "
+            f"GROUPS={cls.TEAM_GROUPS or 'ALL'}"
+        )
+
+
+# ── Priority Map ───────────────────────────────────────────────────────────────
+PRIORITY_MAP = {
+    "1 - Critical": {"name": "Highest"},
+    "2 - High":     {"name": "High"},
+    "3 - Moderate": {"name": "Medium"},
+    "4 - Low":      {"name": "Low"},
+    "5 - Planning": {"name": "Lowest"},
+}
+
+
+# ── Security: HMAC Verification ───────────────────────────────────────────────
+def verify_signature(request_body: bytes, received_secret: str) -> bool:
+    """
+    Compares the X-Snow-Secret header value against the configured
+    WEBHOOK_SECRET.  Uses HMAC-SHA256 comparison to prevent timing attacks.
+
+    The ServiceNow Business Rule sends:
+        headers['X-Snow-Secret'] = WEBHOOK_SECRET value
+    """
+    if not Config.WEBHOOK_SECRET:
+        log.warning("[SECURITY] WEBHOOK_SECRET not set — skipping verification (NOT for production)")
+        return True
+
+    expected = hmac.new(
+        Config.WEBHOOK_SECRET.encode(),
+        request_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, received_secret or "")
+
+
+# ── ServiceNow Client ──────────────────────────────────────────────────────────
+class ServiceNowClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.auth    = (Config.SNOW_USER, Config.SNOW_PASS)
+        self.session.headers = {
+            "Accept":       "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def get_full_record(self, table: str, sys_id: str) -> dict:
+        """
+        Fetches the complete record from ServiceNow when the webhook
+        payload only contains a sys_id.  Dot-walks caller_id.email.
+        """
+        url = f"{Config.SNOW_BASE_URL}/table/{table}/{sys_id}"
+        params = {
+            "sysparm_fields": (
+                "sys_id,number,short_description,description,"
+                "priority,urgency,impact,state,category,"
+                "assigned_to,assigned_to.email,"
+                "assignment_group,assignment_group.name,"
+                "caller_id,caller_id.email,"
+                "opened_at,sys_updated_on,cmdb_ci"
+            ),
+            "sysparm_display_value":          "true",
+            "sysparm_exclude_reference_link": "true",
+        }
+        resp = self.session.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        return resp.json().get("result", {})
+
+    def write_jira_url_back(self, table: str, sys_id: str, jira_key: str, jira_url: str):
+        """
+        Patches the ServiceNow record's work_notes with the Jira story URL
+        so agents can navigate directly from ServiceNow.
+        """
+        if not Config.SNOW_WRITEBACK:
+            return
+        url     = f"{Config.SNOW_BASE_URL}/table/{table}/{sys_id}"
+        payload = {
+            "work_notes": (
+                f"[Auto] Jira Story created: [{jira_key}]({jira_url})\n"
+                f"Navigate: {jira_url}"
+            )
+        }
+        try:
+            resp = self.session.patch(url, json=payload, timeout=15)
+            resp.raise_for_status()
+            log.info(f"  [WRITEBACK] ServiceNow {sys_id} updated with Jira URL")
+        except Exception as exc:
+            log.warning(f"  [WRITEBACK] Failed to update ServiceNow record: {exc}")
+
+
+# ── Jira Client ────────────────────────────────────────────────────────────────
+class JiraClient:
+    def __init__(self):
+        self.base    = Config.JIRA_BASE_URL
+        self.session = requests.Session()
+        self.session.auth    = (Config.JIRA_USER, Config.JIRA_API_TOKEN)
+        self.session.headers = {
+            "Accept":       "application/json",
+            "Content-Type": "application/json",
+        }
+        # In-process cache: email → reporter dict (avoids repeated API calls)
+        self._user_cache: dict = {}
+
+    def issue_exists(self, snow_number: str) -> bool:
+        jql  = f'project = "{Config.JIRA_PROJECT}" AND summary ~ "SNOW-{snow_number}"'
+        resp = self.session.get(
+            f"{self.base}/rest/api/2/search",
+            params={"jql": jql, "maxResults": 1},
+            timeout=15,
+        )
+        return resp.status_code == 200 and resp.json().get("total", 0) > 0
+
+    def resolve_reporter(self, email: str) -> Optional[dict]:
+        """Returns {"accountId": ...} for Cloud or {"name": ...} for Server."""
+        if not email:
+            return None
+        key = email.strip().lower()
+        if key in self._user_cache:
+            return self._user_cache[key]
+
+        result = (
+            self._lookup_cloud(key)
+            if Config.JIRA_TYPE == "cloud"
+            else self._lookup_server(key)
+        )
+        self._user_cache[key] = result
+        return result
+
+    def _lookup_cloud(self, email: str) -> Optional[dict]:
+        try:
+            resp = self.session.get(
+                f"{self.base}/rest/api/3/user/search",
+                params={"query": email},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                for user in resp.json():
+                    if (
+                        user.get("emailAddress", "").lower() == email
+                        and user.get("active", False)
+                    ):
+                        log.info(f"  [REPORTER] Cloud MAPPED {email} → {user['accountId']}")
+                        return {"accountId": user["accountId"]}
+            log.warning(f"  [REPORTER] Cloud UNMAPPED: {email}")
+        except Exception as exc:
+            log.warning(f"  [REPORTER] Cloud lookup error for {email}: {exc}")
+        return None
+
+    def _lookup_server(self, email: str) -> Optional[dict]:
+        try:
+            resp = self.session.get(
+                f"{self.base}/rest/api/2/user/search",
+                params={"username": email, "maxResults": 10},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                for user in resp.json():
+                    if (
+                        user.get("emailAddress", "").lower() == email
+                        and user.get("active", False)
+                    ):
+                        log.info(f"  [REPORTER] Server MAPPED {email} → {user['name']}")
+                        return {"name": user["name"]}
+            log.warning(f"  [REPORTER] Server UNMAPPED: {email}")
+        except Exception as exc:
+            log.warning(f"  [REPORTER] Server lookup error for {email}: {exc}")
+        return None
+
+    def create_issue(self, payload: dict) -> dict:
+        resp = self.session.post(
+            f"{self.base}/rest/api/2/issue", json=payload, timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+# ── Field Mapper ───────────────────────────────────────────────────────────────
+def build_jira_payload(record: dict, reporter_field: Optional[dict]) -> dict:
+    number       = record.get("number", "UNKNOWN")
+    short_desc   = record.get("short_description", "(No summary)")
+    description  = record.get("description", "")
+    priority     = PRIORITY_MAP.get(record.get("priority", ""), {"name": "Medium"})
+    group        = record.get("assignment_group", "")
+    assigned_to  = record.get("assigned_to", "")
+    category     = record.get("category", "")
+    caller       = record.get("caller_id", "")
+    caller_email = record.get("caller_id.email", "")
+    opened_at    = record.get("opened_at", "")
+    ci           = record.get("cmdb_ci", "")
+    state        = record.get("state", "")
+
+    jira_description = f"""
+*ServiceNow Reference:* {number}
+*Assignment Group:* {group}
+*Assigned To (SNOW):* {assigned_to}
+*Caller / Requester:* {caller} ({caller_email})
+*Category:* {category}
+*Configuration Item (CI):* {ci}
+*Priority (SNOW):* {record.get('priority', '')}
+*State:* {state}
+*Opened At:* {opened_at}
+
+----
+h3. Description
+
+{description or '_No description provided._'}
+
+----
+_Auto-created from ServiceNow {number} on assignment event | Group: {group}_
+""".strip()
+
+    fields: dict = {
+        "project":     {"key": Config.JIRA_PROJECT},
+        "issuetype":   {"name": "Story"},
+        "summary":     f"[SNOW-{number}] {short_desc}",
+        "description": jira_description,
+        "priority":    priority,
+        "labels": [
+            "servicenow-import",
+            "auto-assigned",
+            f"snow-{state.lower().replace(' ', '-')}",
+            f"group-{group.lower().replace(' ', '-')[:30]}",
+        ],
+    }
+
+    if reporter_field:
+        fields["reporter"] = reporter_field
+
+    return {"fields": fields}
+
+
+# ── FastAPI App ────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="ServiceNow → Jira Webhook",
+    description="Auto-creates Jira Stories when ServiceNow records are assigned.",
+    version="2.0.0",
+)
+
+# Shared clients (initialised on startup)
+snow_client: Optional[ServiceNowClient] = None
+jira_client: Optional[JiraClient]       = None
+
+
+@app.on_event("startup")
+def startup():
+    global snow_client, jira_client
+    Config.validate()
+    snow_client = ServiceNowClient()
+    jira_client = JiraClient()
+    log.info("[STARTUP] Webhook listener ready.")
+
+
+@app.get("/health")
+def health():
+    """Health check — used by load balancers and monitoring."""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.post("/webhook/snow-assigned")
+async def snow_assigned(request: Request):
+    """
+    Main webhook endpoint.
+
+    Expected JSON payload from ServiceNow Business Rule:
+    {
+        "sys_id":    "abc123...",       ← record sys_id (required)
+        "table":     "sc_request",      ← SNOW table name (required)
+        "number":    "REQ0012345",      ← ticket number (for logging)
+        "event":     "assigned",        ← event type
+        "triggered_by": "business_rule" ← source
+    }
+
+    Headers (required):
+        Content-Type:   application/json
+        X-Snow-Secret:  <value of WEBHOOK_SECRET env var>
+    """
+    # ── 1. Read raw body for signature verification ────────────────────
+    raw_body = await request.body()
+
+    # ── 2. Verify shared secret ────────────────────────────────────────
+    received_secret = request.headers.get("X-Snow-Secret", "")
+    if not verify_signature(raw_body, received_secret):
+        log.warning("[SECURITY] Invalid X-Snow-Secret header — request rejected")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook secret",
+        )
+
+    # ── 3. Parse payload ───────────────────────────────────────────────
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Payload is not valid JSON",
+        )
+
+    sys_id = payload.get("sys_id", "").strip()
+    table  = payload.get("table", "sc_request").strip()
+    number = payload.get("number", sys_id)
+
+    if not sys_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sys_id is required in payload",
+        )
+
+    log.info(f"[WEBHOOK] Received event: table={table}  number={number}  sys_id={sys_id}")
+
+    # ── 4. Fetch full record from ServiceNow ───────────────────────────
+    try:
+        record = snow_client.get_full_record(table, sys_id)
+    except requests.HTTPError as exc:
+        log.error(f"[SNOW FETCH] Failed for {sys_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"ServiceNow fetch failed: {exc}",
+        )
+
+    number = record.get("number", number)
+    group  = record.get("assignment_group", "")
+
+    # ── 5. Team filter (optional) ──────────────────────────────────────
+    if Config.TEAM_GROUPS:
+        if group not in Config.TEAM_GROUPS:
+            log.info(
+                f"[FILTER] {number} group='{group}' not in TEAM_ASSIGNMENT_GROUPS — skipped"
+            )
+            return JSONResponse(
+                status_code=200,
+                content={"status": "skipped", "reason": "group not in team filter", "snow": number},
+            )
+
+    # ── 6. Deduplication — don't create if Jira story already exists ──
+    if jira_client.issue_exists(number):
+        log.info(f"[DEDUP] {number} already exists in Jira — skipped")
+        return JSONResponse(
+            status_code=200,
+            content={"status": "skipped", "reason": "already exists in Jira", "snow": number},
+        )
+
+    # ── 7. Resolve reporter ────────────────────────────────────────────
+    caller_email   = record.get("caller_id.email", "").strip().lower()
+    reporter_field = jira_client.resolve_reporter(caller_email)
+
+    # ── 8. Build and create Jira issue ────────────────────────────────
+    try:
+        jira_payload = build_jira_payload(record, reporter_field)
+        response     = jira_client.create_issue(jira_payload)
+        jira_key     = response.get("key", "?")
+        jira_url     = f"{Config.JIRA_BASE_URL}/browse/{jira_key}"
+    except requests.HTTPError as exc:
+        body = exc.response.text[:300] if exc.response else "no body"
+        log.error(f"[JIRA CREATE] Failed for {number}: {exc}  body={body}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Jira create failed: {body}",
+        )
+
+    log.info(
+        f"[CREATE] {number} → {jira_key}  "
+        f"reporter={'mapped' if reporter_field else 'DEFAULT'}  "
+        f"group={group}"
+    )
+
+    # ── 9. Write Jira URL back to ServiceNow ──────────────────────────
+    snow_client.write_jira_url_back(table, sys_id, jira_key, jira_url)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status":          "created",
+            "snow":            number,
+            "jira_key":        jira_key,
+            "jira_url":        jira_url,
+            "reporter_mapped": reporter_field is not None,
+            "caller_email":    caller_email or "(blank)",
+        },
+    )
+
+
+# ── Entry Point ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run(
+        "snow_jira_webhook:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        reload=False,
+        log_level="info",
+    )
