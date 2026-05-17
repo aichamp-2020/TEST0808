@@ -1,0 +1,57 @@
+All 6 files are ready. Here's exactly what changed and how it all connects:
+
+---
+
+## What Each File Does
+
+| File | Purpose |
+|---|---|
+| `azure_keyvault_helper.py` | SPN login → Key Vault. Shared by both scripts |
+| `snow_jira_webhook.py` | Auto-trigger listener — runs as a server |
+| `snow_jira_creator.py` | Batch backfill — run manually or on schedule |
+| `snow_business_rule.js` | Paste into ServiceNow Business Rule |
+| `.env.template` | Copy to `.env`, fill in your values |
+| `requirements.txt` | `pip install -r requirements.txt` |
+
+---
+
+## How SPN Auth Works in the Code
+
+```
+.env has:
+  AZURE_TENANT_ID     ─┐
+  AZURE_CLIENT_ID     ─┼─→ ClientSecretCredential → Key Vault login
+  AZURE_CLIENT_SECRET ─┘
+
+Key Vault returns:
+  snow-api-password   → Config.SNOW_PASS
+  jira-api-token      → Config.JIRA_API_TOKEN
+  webhook-hmac-secret → Config.WEBHOOK_SECRET
+
+HTTP clients use:
+  ServiceNowClient  →  (SNOW_USER, SNOW_PASS)
+  JiraClient        →  (JIRA_USER, JIRA_API_TOKEN)
+```
+
+---
+
+## Run Order
+
+```bash
+# 1. Install
+pip install -r requirements.txt
+
+# 2. Copy and fill .env
+cp .env.template .env   # fill in your SPN + config values
+
+# 3. Add webhook-hmac-secret to Key Vault (if not done yet)
+az keyvault secret set --vault-name <vault> \
+    --name webhook-hmac-secret \
+    --value $(python -c "import secrets; print(secrets.token_hex(32))")
+
+# 4. Run webhook listener
+uvicorn snow_jira_webhook:app --host 0.0.0.0 --port 8080
+
+# OR run batch backfill
+python snow_jira_creator.py
+```
