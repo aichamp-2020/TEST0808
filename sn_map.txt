@@ -1,1 +1,598 @@
+"""
+ServiceNow → Jira Story Creator  (Team-Aware + Reporter-Mapping Version)
+=========================================================================
+Filters ServiceNow records to ONLY your team's tickets using:
+  1. Assignment Group  (primary — recommended)
+  2. Assigned-To list  (individual members)
+  3. Category/Subcategory
+  4. CI (Configuration Item) ownership
+  5. Watched-by / Opened-by your team
 
+FIXES APPLIED vs original:
+  ✅  caller_id.email added to SNOW_FIELDS so we get the actual email
+  ✅  sysparm_display_value kept true for labels/names, but email dotwalked separately
+  ✅  JiraClient.resolve_account_id() — looks up accountId by email (Jira Cloud)
+  ✅  User lookup cache — avoids hitting Jira API for the same email repeatedly
+  ✅  map_to_jira() now accepts + sets reporter {"accountId": ...}
+  ✅  Graceful fallback — if user not found/inactive, reporter field is omitted
+      (Jira will default to the integration service account)
+  ✅  Detailed per-record logging: MAPPED / UNMAPPED / INACTIVE / NO-EMAIL
+  ✅  reporter_summary in final results JSON for audit/debugging
+  ✅  Jira Server compatibility: uses name field instead of accountId when
+      JIRA_TYPE=server is set in .env
+
+Requirements:
+    pip install requests python-dotenv
+
+Environment Variables (.env):
+    SNOW_INSTANCE         = your-instance.service-now.com
+    SNOW_USER             = servicenow_api_user
+    SNOW_PASS             = servicenow_api_password
+    SNOW_TABLE            = incident
+    SNOW_LIMIT            = 50
+
+    # ── Team Identity ──────────────────────────────────────────────────
+    TEAM_ASSIGNMENT_GROUP = Cloud Platform Engineering
+    TEAM_MEMBERS          = alice@co.com,bob@co.com,sunita@co.com
+    TEAM_CATEGORIES       = AI Platform,Data Engineering,Cloud
+    TEAM_CIS              = SafeAlign,AI-Gateway,OpenShift-Cluster
+    TEAM_FILTER_STRATEGY  = group   # group | members | category | ci | any
+
+    JIRA_BASE_URL         = https://your-org.atlassian.net
+    JIRA_USER             = jira_email@company.com
+    JIRA_API_TOKEN        = your_jira_api_token
+    JIRA_PROJECT_KEY      = PROJ
+    JIRA_TYPE             = cloud   # cloud (default) | server
+"""
+
+import os
+import sys
+import json
+import logging
+import requests
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            f"snow_jira_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        ),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ── Team Config ────────────────────────────────────────────────────────────────
+class TeamConfig:
+    """
+    Defines WHO your team is in ServiceNow terms.
+    All values come from .env — no hardcoding needed.
+    """
+    ASSIGNMENT_GROUP = os.getenv("TEAM_ASSIGNMENT_GROUP", "")
+    MEMBERS = [
+        m.strip() for m in os.getenv("TEAM_MEMBERS", "").split(",") if m.strip()
+    ]
+    CATEGORIES = [
+        c.strip() for c in os.getenv("TEAM_CATEGORIES", "").split(",") if c.strip()
+    ]
+    CIS = [
+        ci.strip() for ci in os.getenv("TEAM_CIS", "").split(",") if ci.strip()
+    ]
+    STRATEGY = os.getenv("TEAM_FILTER_STRATEGY", "group")
+
+
+# ── ServiceNow Query Builder ───────────────────────────────────────────────────
+class SnowQueryBuilder:
+    """
+    Builds a ServiceNow encoded query string scoped to your team.
+    ^ = AND,  ^OR = OR between conditions.
+    """
+
+    BASE_FILTER = "active=true^stateNOT IN6,7"  # exclude Resolved + Closed
+
+    @staticmethod
+    def by_group(group_name: str) -> str:
+        return f"{SnowQueryBuilder.BASE_FILTER}^assignment_group.name={group_name}"
+
+    @staticmethod
+    def by_members(emails: list) -> str:
+        if not emails:
+            return SnowQueryBuilder.BASE_FILTER
+        conditions = "^ORassigned_to.email=".join(emails)
+        return f"{SnowQueryBuilder.BASE_FILTER}^assigned_to.email={conditions}"
+
+    @staticmethod
+    def by_category(categories: list) -> str:
+        if not categories:
+            return SnowQueryBuilder.BASE_FILTER
+        cat_filter = "^ORcategory=".join(categories)
+        return f"{SnowQueryBuilder.BASE_FILTER}^category={cat_filter}"
+
+    @staticmethod
+    def by_ci(ci_names: list) -> str:
+        if not ci_names:
+            return SnowQueryBuilder.BASE_FILTER
+        ci_filter = "^ORcmdb_ci.name=".join(ci_names)
+        return f"{SnowQueryBuilder.BASE_FILTER}^cmdb_ci.name={ci_filter}"
+
+    @staticmethod
+    def combined_any(
+        group: str, members: list, categories: list, cis: list
+    ) -> str:
+        parts = []
+        if group:
+            parts.append(f"assignment_group.name={group}")
+        for m in members:
+            parts.append(f"assigned_to.email={m}")
+        for c in categories:
+            parts.append(f"category={c}")
+        for ci in cis:
+            parts.append(f"cmdb_ci.name={ci}")
+        if not parts:
+            return SnowQueryBuilder.BASE_FILTER
+        return SnowQueryBuilder.BASE_FILTER + "^NQ" + "^OR".join(parts)
+
+    @classmethod
+    def build(cls) -> str:
+        strategy = TeamConfig.STRATEGY.lower()
+        if strategy == "group":
+            if not TeamConfig.ASSIGNMENT_GROUP:
+                raise ValueError("TEAM_ASSIGNMENT_GROUP is required for strategy=group")
+            q = cls.by_group(TeamConfig.ASSIGNMENT_GROUP)
+        elif strategy == "members":
+            if not TeamConfig.MEMBERS:
+                raise ValueError("TEAM_MEMBERS is required for strategy=members")
+            q = cls.by_members(TeamConfig.MEMBERS)
+        elif strategy == "category":
+            if not TeamConfig.CATEGORIES:
+                raise ValueError("TEAM_CATEGORIES is required for strategy=category")
+            q = cls.by_category(TeamConfig.CATEGORIES)
+        elif strategy == "ci":
+            if not TeamConfig.CIS:
+                raise ValueError("TEAM_CIS is required for strategy=ci")
+            q = cls.by_ci(TeamConfig.CIS)
+        elif strategy == "any":
+            q = cls.combined_any(
+                TeamConfig.ASSIGNMENT_GROUP,
+                TeamConfig.MEMBERS,
+                TeamConfig.CATEGORIES,
+                TeamConfig.CIS,
+            )
+        else:
+            raise ValueError(f"Unknown TEAM_FILTER_STRATEGY: {strategy}")
+
+        log.info(f"[SNOW QUERY] Strategy='{strategy}'  →  {q}")
+        return q
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+class Config:
+    SNOW_BASE_URL = f"https://{os.getenv('SNOW_INSTANCE')}/api/now"
+    SNOW_USER     = os.getenv("SNOW_USER")
+    SNOW_PASS     = os.getenv("SNOW_PASS")
+    SNOW_TABLE    = os.getenv("SNOW_TABLE", "incident")
+    SNOW_LIMIT    = int(os.getenv("SNOW_LIMIT", "50"))
+
+    # ✅ FIX 1: Added caller_id.email as a dot-walked field so we get the
+    #           actual email address, not just the display name.
+    #           sysparm_display_value=true still returns human-readable values
+    #           for all other fields (group names, state labels, etc.).
+    SNOW_FIELDS = (
+        "sys_id,number,short_description,description,"
+        "priority,urgency,impact,state,category,"
+        "assigned_to,assigned_to.email,"
+        "assignment_group,"
+        "caller_id,caller_id.email,"          # ← caller_id.email added
+        "opened_at,sys_updated_on,cmdb_ci"
+    )
+
+    JIRA_BASE_URL  = os.getenv("JIRA_BASE_URL")
+    JIRA_USER      = os.getenv("JIRA_USER")
+    JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+    JIRA_PROJECT   = os.getenv("JIRA_PROJECT_KEY", "PROJ")
+
+    # ✅ FIX 2: JIRA_TYPE distinguishes Cloud (accountId) from Server (name).
+    #           Set JIRA_TYPE=server in .env for Jira Data Center / Server.
+    JIRA_TYPE = os.getenv("JIRA_TYPE", "cloud").lower()  # "cloud" | "server"
+
+    @classmethod
+    def validate(cls):
+        required = {
+            "SNOW_INSTANCE":  os.getenv("SNOW_INSTANCE"),
+            "SNOW_USER":      cls.SNOW_USER,
+            "SNOW_PASS":      cls.SNOW_PASS,
+            "JIRA_BASE_URL":  cls.JIRA_BASE_URL,
+            "JIRA_USER":      cls.JIRA_USER,
+            "JIRA_API_TOKEN": cls.JIRA_API_TOKEN,
+        }
+        missing = [k for k, v in required.items() if not v]
+        if missing:
+            raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
+        log.info(f"[CONFIG] Jira type = '{cls.JIRA_TYPE}'")
+
+
+# ── ServiceNow Client ──────────────────────────────────────────────────────────
+class ServiceNowClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.auth = (Config.SNOW_USER, Config.SNOW_PASS)
+        self.session.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def get_records(self, query: str) -> list:
+        url = f"{Config.SNOW_BASE_URL}/table/{Config.SNOW_TABLE}"
+        params = {
+            "sysparm_query":                  query,
+            "sysparm_fields":                 Config.SNOW_FIELDS,
+            "sysparm_limit":                  Config.SNOW_LIMIT,
+            "sysparm_display_value":          "true",
+            "sysparm_exclude_reference_link": "true",
+        }
+        log.info(f"Fetching records from ServiceNow table='{Config.SNOW_TABLE}' ...")
+        resp = self.session.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        records = resp.json().get("result", [])
+        log.info(f"  → {len(records)} team records retrieved.")
+        return records
+
+    def get_my_group_sys_id(self, group_name: str):
+        """Optional helper: resolve group name → sys_id for stricter query."""
+        url = f"{Config.SNOW_BASE_URL}/table/sys_user_group"
+        params = {
+            "sysparm_query":  f"name={group_name}",
+            "sysparm_fields": "sys_id,name",
+            "sysparm_limit":  1,
+        }
+        resp = self.session.get(url, params=params, timeout=15)
+        if resp.status_code == 200:
+            results = resp.json().get("result", [])
+            if results:
+                return results[0]["sys_id"]
+        return None
+
+
+# ── Priority Map ───────────────────────────────────────────────────────────────
+PRIORITY_MAP = {
+    "1 - Critical": {"name": "Highest"},
+    "2 - High":     {"name": "High"},
+    "3 - Moderate": {"name": "Medium"},
+    "4 - Low":      {"name": "Low"},
+    "5 - Planning": {"name": "Lowest"},
+}
+
+
+# ── Field Mapper ───────────────────────────────────────────────────────────────
+def map_to_jira(record: dict, reporter_field: dict | None) -> dict:
+    """
+    Maps a ServiceNow record dict → Jira issue payload.
+
+    reporter_field is either:
+      {"accountId": "..."} for Jira Cloud
+      {"name": "jdoe"}     for Jira Server
+      None                 if user could not be resolved (field omitted)
+    """
+    number      = record.get("number", "UNKNOWN")
+    short_desc  = record.get("short_description", "(No summary)")
+    description = record.get("description", "")
+    priority    = PRIORITY_MAP.get(record.get("priority", ""), {"name": "Medium"})
+    group       = record.get("assignment_group", "")
+    assigned_to = record.get("assigned_to", "")
+    category    = record.get("category", "")
+    caller      = record.get("caller_id", "")
+    caller_email = record.get("caller_id.email", "")
+    opened_at   = record.get("opened_at", "")
+    ci          = record.get("cmdb_ci", "")
+    state       = record.get("state", "")
+
+    jira_description = f"""
+*ServiceNow Reference:* {number}
+*Assignment Group:* {group}
+*Assigned To (SNOW):* {assigned_to}
+*Caller / Requester:* {caller} ({caller_email})
+*Category:* {category}
+*Configuration Item (CI):* {ci}
+*Priority (SNOW):* {record.get('priority', '')}
+*State:* {state}
+*Opened At:* {opened_at}
+
+----
+h3. Description
+
+{description or '_No description provided._'}
+
+----
+_Auto-created from ServiceNow {number} | Group: {group}_
+""".strip()
+
+    fields = {
+        "project":     {"key": Config.JIRA_PROJECT},
+        "issuetype":   {"name": "Story"},
+        "summary":     f"[SNOW-{number}] {short_desc}",
+        "description": jira_description,
+        "priority":    priority,
+        "labels": [
+            "servicenow-import",
+            f"snow-{state.lower().replace(' ', '-')}",
+            f"group-{group.lower().replace(' ', '-')[:30]}",
+        ],
+    }
+
+    # ✅ FIX 3: Only set reporter if we successfully resolved an identifier.
+    #           Omitting the field entirely is safer than sending a bad value.
+    if reporter_field:
+        fields["reporter"] = reporter_field
+
+    return {"fields": fields}
+
+
+# ── Jira Client ────────────────────────────────────────────────────────────────
+class JiraClient:
+    def __init__(self):
+        self.base = Config.JIRA_BASE_URL.rstrip("/")
+        self.session = requests.Session()
+        self.session.auth = (Config.JIRA_USER, Config.JIRA_API_TOKEN)
+        self.session.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    # ── ✅ FIX 4: User resolution methods ─────────────────────────────────────
+
+    def resolve_reporter_cloud(self, email: str) -> dict | None:
+        """
+        Jira CLOUD: looks up a user by email and returns {"accountId": "..."}.
+        Returns None if the user is not found or is inactive.
+
+        Uses /rest/api/3/user/search (Cloud-only endpoint).
+        Normalises email to lowercase before comparison to handle
+        case mismatches between ServiceNow and Jira.
+        """
+        if not email:
+            return None
+
+        email_lower = email.strip().lower()
+        try:
+            resp = self.session.get(
+                f"{self.base}/rest/api/3/user/search",
+                params={"query": email_lower},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log.warning(
+                    f"  [USER LOOKUP] Jira returned {resp.status_code} for email={email}"
+                )
+                return None
+
+            users = resp.json()
+            for user in users:
+                jira_email = user.get("emailAddress", "").strip().lower()
+                is_active  = user.get("active", False)
+
+                if jira_email == email_lower:
+                    if not is_active:
+                        log.warning(
+                            f"  [USER LOOKUP] INACTIVE account found for {email} — skipping reporter"
+                        )
+                        return None
+                    account_id = user["accountId"]
+                    log.info(
+                        f"  [USER LOOKUP] MAPPED {email} → accountId={account_id}"
+                    )
+                    return {"accountId": account_id}
+
+            log.warning(
+                f"  [USER LOOKUP] UNMAPPED — no active Jira user found for email={email}"
+            )
+        except Exception as exc:
+            log.warning(f"  [USER LOOKUP] ERROR for {email}: {exc}")
+
+        return None
+
+    def resolve_reporter_server(self, email: str) -> dict | None:
+        """
+        Jira SERVER / Data Center: looks up a user by email and returns
+        {"name": "<username>"}.
+
+        Uses /rest/api/2/user/search (Server endpoint).
+        """
+        if not email:
+            return None
+
+        email_lower = email.strip().lower()
+        try:
+            resp = self.session.get(
+                f"{self.base}/rest/api/2/user/search",
+                params={"username": email_lower, "maxResults": 10},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log.warning(
+                    f"  [USER LOOKUP] Jira Server returned {resp.status_code} for email={email}"
+                )
+                return None
+
+            users = resp.json()
+            for user in users:
+                jira_email = user.get("emailAddress", "").strip().lower()
+                is_active  = user.get("active", False)
+
+                if jira_email == email_lower:
+                    if not is_active:
+                        log.warning(
+                            f"  [USER LOOKUP] INACTIVE server account for {email} — skipping reporter"
+                        )
+                        return None
+                    username = user["name"]
+                    log.info(
+                        f"  [USER LOOKUP] MAPPED {email} → name={username}"
+                    )
+                    return {"name": username}
+
+            log.warning(
+                f"  [USER LOOKUP] UNMAPPED — no active Jira Server user for email={email}"
+            )
+        except Exception as exc:
+            log.warning(f"  [USER LOOKUP] ERROR for {email}: {exc}")
+
+        return None
+
+    def resolve_reporter(self, email: str) -> dict | None:
+        """
+        Dispatcher: calls the right method based on JIRA_TYPE env var.
+        Returns a ready-to-use reporter dict or None.
+        """
+        if not email or not email.strip():
+            log.warning("  [USER LOOKUP] NO-EMAIL — caller_id.email is blank in ServiceNow")
+            return None
+
+        if Config.JIRA_TYPE == "server":
+            return self.resolve_reporter_server(email)
+        return self.resolve_reporter_cloud(email)
+
+    # ── Existing methods (unchanged) ──────────────────────────────────────────
+
+    def create_issue(self, payload: dict) -> dict:
+        resp = self.session.post(
+            f"{self.base}/rest/api/2/issue", json=payload, timeout=30
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def issue_exists(self, snow_number: str) -> bool:
+        jql = f'project = "{Config.JIRA_PROJECT}" AND summary ~ "SNOW-{snow_number}"'
+        resp = self.session.get(
+            f"{self.base}/rest/api/2/search",
+            params={"jql": jql, "maxResults": 1},
+            timeout=15,
+        )
+        return resp.status_code == 200 and resp.json().get("total", 0) > 0
+
+
+# ── Orchestrator ───────────────────────────────────────────────────────────────
+def run():
+    Config.validate()
+
+    snow  = ServiceNowClient()
+    jira  = JiraClient()
+    query = SnowQueryBuilder.build()
+
+    records = snow.get_records(query)
+    if not records:
+        log.warning(
+            "No team records found. Check your TEAM_* env vars and SNOW query."
+        )
+        return
+
+    results = {
+        "created":          [],
+        "skipped":          [],
+        "failed":           [],
+        "reporter_summary": {   # ✅ audit trail for reporter mapping
+            "mapped":    [],
+            "unmapped":  [],
+            "no_email":  [],
+        },
+    }
+
+    # ✅ FIX 5: Cache resolved users — avoids hammering Jira's user search API
+    #            with repeated lookups for the same email address.
+    #            Key: email (str) → Value: reporter field dict or None
+    user_cache: dict = {}
+
+    for rec in records:
+        number       = rec.get("number", "UNKNOWN")
+        group        = rec.get("assignment_group", "?")
+        caller_email = rec.get("caller_id.email", "").strip().lower()
+
+        try:
+            if jira.issue_exists(number):
+                log.info(f"  [SKIP]   {number} (group={group}) — already in Jira")
+                results["skipped"].append(number)
+                continue
+
+            # ── Resolve reporter (cached) ──────────────────────────────────
+            if caller_email not in user_cache:
+                user_cache[caller_email] = jira.resolve_reporter(caller_email)
+
+            reporter_field = user_cache[caller_email]
+
+            # Populate audit summary
+            if not caller_email:
+                results["reporter_summary"]["no_email"].append(number)
+            elif reporter_field:
+                results["reporter_summary"]["mapped"].append(
+                    {"snow": number, "email": caller_email}
+                )
+            else:
+                results["reporter_summary"]["unmapped"].append(
+                    {"snow": number, "email": caller_email}
+                )
+
+            # ── Build and send Jira payload ────────────────────────────────
+            payload  = map_to_jira(rec, reporter_field)
+            response = jira.create_issue(payload)
+            jira_key = response.get("key", "?")
+
+            reporter_info = (
+                f"reporter={'set → ' + caller_email if reporter_field else 'DEFAULT (unmapped)'}"
+            )
+            log.info(f"  [CREATE] {number} → {jira_key}  ({reporter_info})  group={group}")
+
+            results["created"].append({
+                "snow":          number,
+                "jira":          jira_key,
+                "url":           f"{Config.JIRA_BASE_URL}/browse/{jira_key}",
+                "reporter_mapped": reporter_field is not None,
+                "caller_email":  caller_email or "(blank)",
+            })
+
+        except requests.HTTPError as exc:
+            body = exc.response.text[:300] if exc.response else "no body"
+            log.error(f"  [FAIL]   {number} — HTTP {exc.response.status_code}: {body}")
+            results["failed"].append({"snow": number, "error": str(exc), "detail": body})
+        except Exception as exc:
+            log.error(f"  [FAIL]   {number} — {exc}")
+            results["failed"].append({"snow": number, "error": str(exc)})
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    log.info("\n" + "=" * 65)
+    log.info(
+        f"DONE  "
+        f"Created={len(results['created'])}  "
+        f"Skipped={len(results['skipped'])}  "
+        f"Failed={len(results['failed'])}"
+    )
+    rs = results["reporter_summary"]
+    log.info(
+        f"REPORTER  "
+        f"Mapped={len(rs['mapped'])}  "
+        f"Unmapped={len(rs['unmapped'])}  "
+        f"NoEmail={len(rs['no_email'])}"
+    )
+
+    if rs["unmapped"]:
+        log.warning("Unmapped reporters (users not found / inactive in Jira):")
+        for item in rs["unmapped"]:
+            log.warning(f"    SNOW={item['snow']}  email={item['email']}")
+
+    if rs["no_email"]:
+        log.warning("Records with no caller email in ServiceNow:")
+        for ticket in rs["no_email"]:
+            log.warning(f"    SNOW={ticket}")
+
+    out_file = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(out_file, "w") as f:
+        json.dump(results, f, indent=2)
+    log.info(f"Results → {out_file}")
+
+
+if __name__ == "__main__":
+    run()
